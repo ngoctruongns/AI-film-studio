@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { FileRef, STUDIO_DIR, StatusKey, StepSpec, STATUS_LABEL, parseStatus } from './config';
 import { applySelect, columnIndex, findSection, findTable, replaceSection, stripMd } from './markdown';
+import { scanBlender } from './blender';
 import { readRuns } from './runs';
 import { Placeholders, ProjectModel, fill, findEpisode, findScene, findSegment, placeholdersFor } from './scanner';
 
@@ -36,9 +37,23 @@ function git(root: string, args: string[]): string {
   }
 }
 
-function virtualSource(model: ProjectModel, src: NonNullable<FileRef['source']>): { label: string; text: string } {
+function virtualSource(model: ProjectModel, src: NonNullable<FileRef['source']>, ph: Placeholders): { label: string; text: string } {
   const root = model.config.root;
   switch (src) {
+    case 'blender-scene': {
+      const ep = findEpisode(model, ph.ep);
+      if (!ep) return { label: 'Blender của cảnh', text: '(không rõ tập)' };
+      const bm = scanBlender(model, ep);
+      const shots = bm.shots.filter((s) => s.scene === ph.scene);
+      const files = [...new Set(shots.map((s) => s.file))].map((f) => bm.files.find((x) => x.name === f));
+      const text = shots.length
+        ? [
+            ...shots.map((s) => `- shot ${s.code} · ${s.file} · camera ${s.camera ?? '?'} · frame ${s.start}–${s.end} (${((s.end - s.start + 1) / bm.cfg.fps).toFixed(1)} s, nguồn ${s.source})`),
+            ...files.filter(Boolean).map((f) => `- ${f!.name}: ${f!.rel ?? 'dựng tại máy'} · script ${f!.scripts.join(', ') || '—'} · hướng dẫn ${f!.guides.join(', ') || '—'}`),
+          ].join('\n')
+        : `(${ph.scene} chưa có shot Blender nào — marker = mã cảnh, camera ${bm.cfg.cameraPrefix}${ph.scene})`;
+      return { label: `Blender của ${ph.scene}`, text };
+    }
     case 'git-diff-stat':
       return { label: 'git diff --stat (chưa stage)', text: git(root, ['diff', '--stat']) || '(không có thay đổi chưa stage)' };
     case 'git-status':
@@ -75,7 +90,7 @@ export function targetKey(t: StepTarget): string {
 
 export function resolveRef(model: ProjectModel, ref: FileRef, ph: Placeholders, role: 'input' | 'output'): ResolvedFile {
   if (ref.source) {
-    const v = virtualSource(model, ref.source);
+    const v = virtualSource(model, ref.source, ph);
     const text = ref.maxChars && v.text.length > ref.maxChars ? v.text.slice(0, ref.maxChars) + '\n…(cắt bớt)' : v.text;
     return { ref, role, label: ref.label ?? v.label, abs: '', rel: `(${ref.source})`, exists: true, found: true, line: 0, text, virtual: true };
   }

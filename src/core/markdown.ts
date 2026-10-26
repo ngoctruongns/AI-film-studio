@@ -91,8 +91,11 @@ export function stripMd(s: string): string {
   return s
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/`([^`]*)`/g, '$1')
-    .replace(/(\*\*|__)(.*?)\1/g, '$2')
-    .replace(/(\*|_)(\S.*?)\1/g, '$2')
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/(^|[^\w])__(\S.*?)__(?=[^\w]|$)/g, '$1$2')
+    .replace(/\*(\S.*?)\*/g, '$1')
+    // _nghiêng_ chỉ khi đứng ngoài từ — giữ nguyên CAM_E01_2, K_canh
+    .replace(/(^|[^\w])_(\S.*?)_(?=[^\w]|$)/g, '$1$2')
     .replace(/<[^>]+>/g, '')
     .replace(/~~/g, '')
     .trim();
@@ -106,7 +109,9 @@ export function columnIndex(table: MdTable, name: string | undefined): number {
   if (!name) return -1;
   const n = name.toLowerCase();
   let idx = table.headers.findIndex((h) => h.toLowerCase() === n);
-  if (idx < 0) idx = table.headers.findIndex((h) => h.toLowerCase().includes(n));
+  if (idx < 0) idx = table.headers.findIndex((h) => h.toLowerCase().startsWith(n));
+  // khớp một phần chỉ với tên dài — "Ra" không được khớp "Frame"
+  if (idx < 0 && n.length >= 4) idx = table.headers.findIndex((h) => h.toLowerCase().includes(n));
   return idx;
 }
 

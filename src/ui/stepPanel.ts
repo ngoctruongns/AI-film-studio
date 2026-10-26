@@ -1,20 +1,30 @@
-// Tab một bước công việc: (bước, đối tượng) — vd. (④ Chia cảnh, EP01·K). Mỗi cặp một tab, mở lại thì nhảy về tab cũ.
+// Tab của một ĐỐI TƯỢNG (dự án / tập / phân đoạn / cảnh): trên cùng overview + sơ đồ các bước của cấp đó, bấm bước nào
+// thì nội dung bước đó hiện bên dưới (lần đầu: bước 1). Mỗi đối tượng một tab, mở lại thì nhảy về tab cũ.
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { STATUS_LABEL } from '../core/config';
+import { STATUS_LABEL, Scope, StepSpec, statusSymbol } from '../core/config';
+import { ApproveLevel, applyPlan, planApprove } from '../core/approve';
+import { formatDuration } from '../core/markdown';
 import { ResolvedStep, StepTarget, buildPrompt, extractOutput, mergeOutput, resolveStep, targetKey } from '../core/context';
 import { ModelConfig, estimateCost } from '../core/providers';
 import { MediaFile, listSceneMedia, mediaTargetName, upsertResult } from '../core/results';
 import { RunRecord, newRunId, readRuns, runPath, writeRun } from '../core/runs';
 import { fill, findEpisode, findScene, findSegment } from '../core/scanner';
+import { scanBlender } from '../core/blender';
+import { gotoShotInBlender } from './blenderPanel';
 import { ModelRegistry } from './models';
 import { Studio } from './studio';
 import { handleOpen, renderMarkdown, shell } from './webview';
 
 interface PanelState {
-  stepId: string;
+  /** bước đang hiện — trống thì lấy bước đầu của cấp */
+  stepId?: string;
   target: StepTarget;
+}
+
+export function scopeOf(t: StepTarget): Scope {
+  return t.scene ? 'scene' : t.seg ? 'segment' : t.ep ? 'episode' : 'project';
 }
 
 const MEDIA_KINDS = [
@@ -29,24 +39,27 @@ export class StepPanel {
   static readonly viewType = 'aiFilmStudio.step';
   private static panels = new Map<string, StepPanel>();
 
-  private request = '';
-  private modelId?: string;
-  private compareId?: string;
+  /** yêu cầu thêm / model / model so sánh — riêng cho từng bước */
+  private requests = new Map<string, string>();
+  private modelIds = new Map<string, string>();
+  private compareIds = new Map<string, string>();
   /** các lần chạy của tab này (mới nhất đầu) — chạy song song được để so sánh model */
   private runs: RunRecord[] = [];
   private aborts = new Map<string, AbortController>();
   private shown?: number;
   private readonly subs: vscode.Disposable[] = [];
 
-  static open(studio: Studio, models: ModelRegistry, stepId: string, target: StepTarget): void {
-    const key = `${stepId}|${targetKey(target)}`;
+  /** Mở tab của đối tượng; có stepId thì chọn luôn bước đó */
+  static open(studio: Studio, models: ModelRegistry, stepId: string | undefined, target: StepTarget): void {
+    const key = targetKey(target);
     const existing = this.panels.get(key);
     if (existing) {
+      if (stepId && stepId !== existing.state.stepId) existing.select(stepId);
       existing.panel.reveal();
       return;
     }
-    const step = studio.config?.pipeline.steps.find((s) => s.id === stepId);
-    const panel = vscode.window.createWebviewPanel(this.viewType, `${step?.no ?? ''} ${targetKey(target)}`, vscode.ViewColumn.Active, {
+    const icon = { project: '📁', episode: '🎬', segment: '▤', scene: '◆' }[scopeOf(target)];
+    const panel = vscode.window.createWebviewPanel(this.viewType, `${icon} ${key}`, vscode.ViewColumn.Active, {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: StepPanel.roots(studio),
@@ -55,7 +68,7 @@ export class StepPanel {
   }
 
   static revive(panel: vscode.WebviewPanel, studio: Studio, models: ModelRegistry, state: PanelState | undefined): void {
-    if (!state?.stepId) {
+    if (!state?.target) {
       panel.dispose();
       return;
     }
@@ -74,8 +87,9 @@ export class StepPanel {
     private models: ModelRegistry,
     private state: PanelState,
   ) {
-    const key = `${state.stepId}|${targetKey(state.target)}`;
+    const key = targetKey(state.target);
     StepPanel.panels.set(key, this);
+    if (!state.stepId || !this.steps().some((x) => x.id === state.stepId)) state.stepId = this.steps()[0]?.id;
     panel.webview.options = { enableScripts: true, localResourceRoots: StepPanel.roots(studio) };
     // đăng ký nhận tin TRƯỚC khi gán html — tin 'ready' của webview không bị lỡ
     this.subs.push(
@@ -90,6 +104,26 @@ export class StepPanel {
     });
   }
 
+  /** các bước của cấp này, theo thứ tự trong pipeline.yaml */
+  private steps(): StepSpec[] {
+    const scope = scopeOf(this.state.target);
+    return (this.studio.config?.pipeline.steps ?? []).filter((x) => x.scope === scope);
+  }
+
+  private get stepId(): string {
+    return this.state.stepId ?? '';
+  }
+
+  private get request(): string {
+    return this.requests.get(this.stepId) ?? '';
+  }
+
+  select(stepId: string): void {
+    this.state.stepId = stepId;
+    this.shown = undefined;
+    this.post();
+  }
+
   private resolve(): ResolvedStep | undefined {
     const step = this.studio.config?.pipeline.steps.find((s) => s.id === this.state.stepId);
     if (!step || !this.studio.model) return undefined;
@@ -97,7 +131,8 @@ export class StepPanel {
   }
 
   private model(): ModelConfig | undefined {
-    return (this.modelId && this.models.get(this.modelId)) || this.models.forStep(this.state.stepId);
+    const id = this.modelIds.get(this.stepId);
+    return (id && this.models.get(id)) || this.models.forStep(this.stepId);
   }
 
   private mediaDirs(rs: ResolvedStep): { dir: string; inRepo: boolean }[] {
@@ -116,10 +151,89 @@ export class StepPanel {
     return listSceneMedia(this.mediaDirs(rs), rs.target.ep, rs.target.scene);
   }
 
+  // ------------------------------------------------------------------ overview + sơ đồ bước
+  private nodes() {
+    const t = this.state.target;
+    const ep = this.studio.model && findEpisode(this.studio.model, t.ep);
+    const seg = findSegment(ep, t.seg);
+    const scene = findScene(seg, t.scene);
+    return { ep, seg, scene };
+  }
+
+  private overview() {
+    const model = this.studio.model!;
+    const st = model.config.project.status;
+    const scope = scopeOf(this.state.target);
+    const { ep, seg, scene } = this.nodes();
+    const crumbs: { label: string; target?: StepTarget }[] = [{ label: model.config.project.name, target: {} }];
+    if (ep) crumbs.push({ label: ep.id, target: { ep: ep.id } });
+    if (seg) crumbs.push({ label: seg.code, target: { ep: ep!.id, seg: seg.code } });
+    if (scene) crumbs.push({ label: scene.code });
+    const facts: { k: string; v: string }[] = [];
+    const links: { cmd: string; arg?: string; label: string }[] = [];
+    const count = (list: { status?: string }[]) => `${list.length}${list.length ? ` (✅ ${list.filter((x) => x.status === 'done').length})` : ''}`;
+    let title = model.config.project.name;
+    let status: string | undefined;
+    let approve: { level: ApproveLevel; label: string; done: boolean } | undefined;
+    if (scope === 'project') {
+      const live = model.episodes.filter((e) => !e.legacy);
+      facts.push({ k: 'Tập', v: `${model.episodes.length} (${live.length} đã vào cấu trúc mới)` });
+      facts.push({ k: 'Cảnh', v: count(live.flatMap((e) => e.segments.flatMap((s) => s.scenes))) });
+      const next = model.episodes.find((e) => e.releaseDate && e.releaseDate >= new Date());
+      if (next) facts.push({ k: 'Phát hành kế tiếp', v: `${next.id} · ${next.releaseDate!.toLocaleDateString('vi-VN')}` });
+      links.push({ cmd: 'dashboard', label: '📊 Tổng quan' }, { cmd: 'settings', label: '⚙ Cài đặt AI' });
+    } else if (scope === 'episode' && ep) {
+      title = `${ep.id} · ${ep.slug.replace(/-/g, ' ')}`;
+      const segs = ep.segments.filter((x) => !x.dropped);
+      const scenes = segs.flatMap((x) => x.scenes).filter((c) => c.status !== 'dropped');
+      facts.push({ k: 'Phân đoạn', v: count(segs) }, { k: 'Cảnh', v: count(scenes) });
+      facts.push({ k: 'Giây cảnh', v: `${formatDuration(ep.sceneSeconds)}${model.config.project.episodeCapSeconds ? ` / trần ${formatDuration(model.config.project.episodeCapSeconds)}` : ''}` });
+      if (ep.releaseDate) facts.push({ k: 'Phát hành', v: ep.releaseDate.toLocaleDateString('vi-VN') });
+      links.push({ cmd: 'openBlender', label: '🧊 Blender của tập' });
+      if (ep.files['readme']) links.push({ cmd: 'openFile', arg: ep.files['readme'], label: 'README tập' });
+      approve = { level: 'episode', label: `tập ${ep.id}`, done: segs.length > 0 && segs.every((x) => x.status === 'done') && scenes.every((c) => c.status === 'done') };
+    } else if (scope === 'segment' && ep && seg) {
+      title = `${seg.code} · ${seg.name}`;
+      status = seg.statusText;
+      const scenes = seg.scenes.filter((c) => c.status !== 'dropped');
+      facts.push({ k: 'Trạng thái', v: `${statusSymbol(seg.status, st)} ${seg.status ? STATUS_LABEL[seg.status] : '—'}` });
+      facts.push({ k: 'Cảnh', v: count(scenes) });
+      facts.push({ k: 'Giây', v: `${scenes.reduce((a, c) => a + (c.seconds ?? 0), 0)} s cảnh${seg.plannedSeconds ? ` / dự kiến ${seg.plannedSeconds} s` : ''}` });
+      if (seg.files['canh']) links.push({ cmd: 'grid', label: '▦ Bảng cảnh dạng lưới' });
+      links.push({ cmd: 'openBlender', label: '🧊 Blender' });
+      if (seg.dir) links.push({ cmd: 'reveal', arg: seg.dir, label: 'thư mục' });
+      approve = { level: 'segment', label: `phân đoạn ${seg.code}`, done: seg.status === 'done' && scenes.every((c) => c.status === 'done') };
+    } else if (scope === 'scene' && seg && scene) {
+      title = `${scene.code}${scene.seconds ? ` · ${scene.seconds} s` : ''}`;
+      facts.push({ k: 'Trạng thái', v: `${statusSymbol(scene.status, st)} ${scene.status ? STATUS_LABEL[scene.status] : '—'}` });
+      facts.push({ k: 'Hình', v: scene.title });
+      links.push({ cmd: 'openFile', arg: `${scene.file}#${scene.line}`, label: `dòng ${scene.code} trong ${seg.code}_canh.md` });
+      links.push({ cmd: 'grid', label: '▦ Bảng cảnh' }, { cmd: 'openBlender', label: '🧊 Blender' });
+      approve = { level: 'scene', label: `cảnh ${scene.code}`, done: scene.status === 'done' };
+    }
+    return { scope, title, status, crumbs, facts, links, approve };
+  }
+
+  private stepStates() {
+    const model = this.studio.model!;
+    const { scene } = this.nodes();
+    return this.steps().map((x) => {
+      const r = resolveStep(model, x, this.state.target);
+      let state: 'done' | 'todo' | 'locked' | 'none' = 'none';
+      if (!r.gate.ok) state = 'locked';
+      else if (r.output) state = r.output.exists && r.output.found ? 'done' : 'todo';
+      else if (x.view?.includes('media')) state = scene?.result ? 'done' : 'todo';
+      return { id: x.id, no: x.no, title: x.title, executor: x.executor, state, model: x.executor === 'chat' ? this.models.forStep(x.id)?.id : undefined };
+    });
+  }
+
   // ------------------------------------------------------------------ view model
   private vm() {
+    if (!this.studio.model) return { error: this.studio.error ?? 'Chưa nạp dự án' };
+    const overview = this.overview();
+    const steps = this.stepStates();
     const rs = this.resolve();
-    if (!rs) return { error: this.studio.error ?? `Không thấy bước "${this.state.stepId}" trong .studio/pipeline.yaml` };
+    if (!rs) return { overview, steps, current: this.stepId, target: this.state.target, error: steps.length ? `Không thấy bước "${this.stepId}"` : 'Cấp này chưa có bước nào trong .studio/pipeline.yaml' };
     const m = this.model();
     const files = [...rs.inputs, ...(rs.output ? [rs.output] : [])].map((f, i) => ({
       i,
@@ -171,8 +285,23 @@ export class StepPanel {
         videos: files.filter((f) => f.kind === 'V').map((f) => f.name),
       };
     }
+    let blender: object | undefined;
+    if (ep && !ep.legacy && rs.target.scene) {
+      const bm = scanBlender(this.studio.model!, ep);
+      const shots = bm.shots.filter((s) => s.scene === rs.target.scene);
+      blender = {
+        shots: shots.map((s) => ({ code: s.code, file: s.file, camera: s.camera, start: s.start, end: s.end, source: s.source, conflict: s.conflicts.length > 0, seconds: (s.end - s.start + 1) / bm.cfg.fps })),
+        fileAbs: Object.fromEntries(bm.files.filter((f) => f.abs).map((f) => [f.name, f.abs])),
+        issues: bm.issues.filter((i) => i.scene === rs.target.scene).map((i) => i.message),
+      };
+    }
     return {
+      overview,
+      steps,
+      current: this.stepId,
+      request: this.request,
       title: rs.title,
+      blender,
       step: rs.step,
       target: rs.target,
       gate: rs.gate,
@@ -180,7 +309,7 @@ export class StepPanel {
       notes,
       models: this.models.list().map((x) => ({ id: x.id, title: x.title ?? x.id })),
       model: m?.id,
-      compare: this.compareId,
+      compare: this.compareIds.get(this.stepId),
       estimate,
       scripts,
       grid: view.includes('grid') && !!seg?.files['canh'],
@@ -191,7 +320,7 @@ export class StepPanel {
         title: scene.title,
       },
       media,
-      runs: this.runs,
+      runs: this.runs.filter((r) => r.step === rs.step.id),
       recent,
       hasOutput: !!rs.output,
     };
@@ -210,14 +339,19 @@ export class StepPanel {
       case 'open':
         return handleOpen(m);
       case 'request':
-        this.request = String(m.text ?? '');
+        this.requests.set(m.step ?? this.stepId, String(m.text ?? ''));
         return this.post();
       case 'model':
-        this.modelId = m.id;
+        this.modelIds.set(this.stepId, m.id);
         return this.post();
       case 'compare':
-        this.compareId = m.id || undefined;
+        if (m.id) this.compareIds.set(this.stepId, m.id);
+        else this.compareIds.delete(this.stepId);
         return this.post();
+      case 'selectStep':
+        return this.select(String(m.id));
+      case 'approve':
+        return this.approve(m.undo === true);
       case 'saveResult':
         return this.saveResult(m.result);
       case 'cmd':
@@ -257,6 +391,22 @@ export class StepPanel {
             return vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(m.arg));
           case 'settings':
             return vscode.commands.executeCommand('aiFilmStudio.openSettings');
+          case 'dashboard':
+            return vscode.commands.executeCommand('aiFilmStudio.openDashboard');
+          case 'target':
+            return StepPanel.open(this.studio, this.models, undefined, JSON.parse(m.arg));
+          case 'openFile': {
+            const [f, line] = String(m.arg).split('#');
+            return handleOpen({ path: f, line: Number(line ?? 0) });
+          }
+          case 'reveal':
+            return vscode.commands.executeCommand('revealInExplorer', vscode.Uri.file(m.arg));
+          case 'openBlender':
+            return vscode.commands.executeCommand('aiFilmStudio.openBlender', { ep: this.state.target.ep });
+          case 'blenderGoto': {
+            const [file, start, end, cam] = String(m.arg).split('|');
+            return gotoShotInBlender(this.studio, file, Number(start), Number(end), cam || undefined);
+          }
         }
     }
   }
@@ -296,7 +446,8 @@ export class StepPanel {
     }
     const list = [main];
     if (compare) {
-      const c = this.compareId && this.models.get(this.compareId);
+      const cid = this.compareIds.get(this.stepId);
+      const c = cid && this.models.get(cid);
       if (!c || c.id === main.id) {
         vscode.window.showWarningMessage('Chọn model thứ hai (khác model chính) ở ô "So sánh với".');
         return;
@@ -541,12 +692,60 @@ export class StepPanel {
     this.studio.refresh();
   }
 
+  // ------------------------------------------------------------------ duyệt theo cấp
+  private async approve(undo: boolean): Promise<void> {
+    const model = this.studio.model;
+    const ov = model && this.overview();
+    const { ep, seg, scene } = this.nodes();
+    if (!model || !ov?.approve || !ep) return;
+    const plan = planApprove(model, ov.approve.level, ep, seg, scene?.code, undo ? 'review' : 'done');
+    if (!plan.changes.length) {
+      vscode.window.showInformationMessage(`${ov.approve.label}: không có dòng nào cần đổi.`);
+      return;
+    }
+    const files = [...new Set(plan.changes.map((c) => path.basename(c.file)))];
+    const dirty = vscode.workspace.textDocuments.filter((d) => d.isDirty && plan.changes.some((c) => c.file === d.uri.fsPath));
+    if (dirty.length) {
+      vscode.window.showWarningMessage(`${dirty.map((d) => path.basename(d.uri.fsPath)).join(', ')} đang có thay đổi chưa lưu — lưu trước rồi duyệt.`);
+      return;
+    }
+    const codes = plan.changes.map((c) => c.code);
+    const ok = await vscode.window.showInformationMessage(
+      `${undo ? 'Bỏ duyệt' : 'Duyệt'} ${plan.label}: đổi trạng thái ${codes.length} dòng (${codes.slice(0, 12).join(', ')}${codes.length > 12 ? '…' : ''}) trong ${files.join(', ')}?`,
+      { modal: true },
+      undo ? 'Bỏ duyệt' : 'Duyệt',
+    );
+    if (!ok) return;
+    const res = applyPlan(plan);
+    vscode.window.showInformationMessage(
+      `${undo ? 'Đã bỏ duyệt' : 'Đã duyệt'} ${plan.label} (${codes.length - res.skipped.length} dòng)${res.skipped.length ? ` · bỏ qua ${res.skipped.join(', ')} (ô vừa bị sửa)` : ''}. Xem bằng git diff.`,
+    );
+    this.studio.refresh();
+  }
+
   // ------------------------------------------------------------------ html
   private html(): string {
     return shell(
       this.panel.webview,
       'Bước',
-      `<div id="head"></div>
+      `<style>
+        .ov { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start; margin-top:10px }
+        .crumbs { font-size:.9em } .crumbs a { margin-right:2px }
+        .facts { display:flex; flex-wrap:wrap; gap:4px 18px; margin-top:4px } .facts b { color:var(--vscode-descriptionForeground); font-weight:normal }
+        .stepper { display:flex; flex-wrap:wrap; align-items:center; gap:2px 4px; border:2px solid var(--vscode-focusBorder); border-radius:6px; padding:8px 10px; margin:10px 0 6px }
+        .stepper .st { background:transparent; color:var(--vscode-foreground); border:1px solid transparent; padding:4px 10px; border-radius:14px; cursor:pointer; font:inherit }
+        .stepper .st:hover { border-color:var(--vscode-focusBorder) }
+        .stepper .st.cur { background:var(--vscode-button-background); color:var(--vscode-button-foreground); font-weight:600 }
+        .stepper .st .mk { margin-left:4px; font-size:.85em }
+        .stepper .st.done .mk { color:var(--vscode-testing-iconPassed, #3c3) }
+        .stepper .st.cur .mk { color:inherit }
+        .stepper .ar { color:var(--vscode-descriptionForeground) }
+        .appr { font-weight:600 }
+      </style>
+      <div id="overview"></div>
+      <div id="stepper" class="stepper"></div>
+      <div id="head"></div>
+      <div id="body">
       <div id="media"></div>
       <div class="row" style="align-items:flex-start;gap:16px;margin-top:8px">
         <div class="col" style="flex:1 1 340px;min-width:280px">
@@ -571,6 +770,7 @@ export class StepPanel {
         <div class="row" style="margin-top:6px" id="actions"></div>
         <div id="runs" class="col" style="margin-top:8px"></div>
         <div id="recent"></div>
+      </div>
       </div>`,
       CLIENT_JS,
     );
@@ -580,16 +780,17 @@ export class StepPanel {
 const CLIENT_JS = `
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
-let st = vscode.getState() || {};
-$('req').value = st.request || '';
+let lastStep = null;
 let t;
-$('req').addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => {
-  vscode.setState({ ...vscode.getState(), request: $('req').value });
-  vscode.postMessage({ type: 'request', text: $('req').value }); }, 400); });
+$('req').addEventListener('input', () => { clearTimeout(t); const step = lastStep; t = setTimeout(() =>
+  vscode.postMessage({ type: 'request', step, text: $('req').value }), 400); });
 $('model').addEventListener('change', () => vscode.postMessage({ type: 'model', id: $('model').value }));
 $('cmp').addEventListener('change', () => vscode.postMessage({ type: 'compare', id: $('cmp').value }));
-if (st.request) vscode.postMessage({ type: 'request', text: st.request });
 document.addEventListener('click', (e) => {
+  const sb = e.target.closest('[data-step]');
+  if (sb) vscode.postMessage({ type: 'selectStep', id: sb.dataset.step });
+  const ab = e.target.closest('[data-approve]');
+  if (ab) vscode.postMessage({ type: 'approve', undo: ab.dataset.approve === 'undo' });
   if (e.target.closest('#saveResult')) vscode.postMessage({ type: 'saveResult', result: {
     attempts: $('rAttempts').value, chosen: $('rChosen').value, model: $('rModel').value, note: $('rNote').value } });
 });
@@ -630,12 +831,45 @@ function renderMedia(md, scene) {
   return h;
 }
 
+function renderTop(vm) {
+  const o = vm.overview;
+  if (!o) { $('overview').innerHTML = ''; $('stepper').hidden = true; return; }
+  const crumbs = o.crumbs.map((c, i) => c.target && i < o.crumbs.length - 1
+    ? '<a data-cmd="target" data-arg="' + esc(JSON.stringify(c.target)) + '">' + esc(c.label) + '</a>' : '<b>' + esc(c.label) + '</b>').join(' › ');
+  const facts = o.facts.map((f) => '<span><b>' + esc(f.k) + ':</b> ' + esc(f.v) + '</span>').join('');
+  const links = o.links.map((l) => '<button class="link" data-cmd="' + esc(l.cmd) + '"' + (l.arg ? ' data-arg="' + esc(l.arg) + '"' : '') + '>' + esc(l.label) + '</button>').join('');
+  let appr = '';
+  if (o.approve) appr = o.approve.done
+    ? '<div class="col" style="align-items:flex-end"><span class="ok appr">✅ ' + esc(o.approve.label) + ' đã duyệt</span><button class="sec" data-approve="undo">Bỏ duyệt</button></div>'
+    : '<button class="appr" data-approve="do" title="đổi trạng thái thành ✅ cho ' + esc(o.approve.label) + (o.approve.level === 'scene' ? '' : ' và mọi cảnh bên trong') + '">✅ Duyệt ' + esc(o.approve.label) + '</button>';
+  $('overview').innerHTML = '<div class="ov"><div style="flex:1 1 400px"><div class="crumbs muted">' + crumbs + '</div><h1 style="margin:2px 0">' + esc(o.title) + '</h1>'
+    + '<div class="facts">' + facts + '</div><div style="margin-top:4px">' + links + '</div></div>' + appr + '</div>';
+  const mk = { done: '✓', locked: '🔒', todo: '', none: '' };
+  $('stepper').hidden = !vm.steps.length;
+  $('stepper').innerHTML = vm.steps.map((x, i) => (i ? '<span class="ar">→</span>' : '')
+    + '<button class="st ' + x.state + (x.id === vm.current ? ' cur' : '') + '" data-step="' + esc(x.id) + '" title="' + esc(x.title + (x.model ? ' · ' + x.model : '') + (x.state === 'locked' ? ' · cổng chưa mở' : '')) + '">'
+    + esc(x.no) + ' ' + esc(shortTitle(x.title)) + (mk[x.state] ? '<span class="mk">' + mk[x.state] + '</span>' : '') + '</button>').join('');
+}
+function shortTitle(t) { return String(t).replace(/\s*[—(].*$/, '').replace(/^Kịch bản chi tiết$/, 'Kịch bản'); }
+
 function render(vm) {
+  renderTop(vm);
+  if (vm.current !== lastStep) { lastStep = vm.current; $('req').value = vm.request || ''; $('pv').innerHTML = '<p class="muted">—</p>'; $('pvTitle').innerHTML = 'Xem nhanh <span class="muted">(bấm "xem" một file bên trái)</span>'; }
+  vscode.setState({ target: vm.target || (vscode.getState() || {}).target, stepId: vm.current });
+  $('body').hidden = !!vm.error;
   if (vm.error) { $('head').innerHTML = '<p class="err">' + esc(vm.error) + '</p>'; return; }
-  vscode.setState({ ...vscode.getState(), stepId: vm.step.id, target: vm.target });
   const ex = { human: 'người làm', chat: 'AI văn bản', agent: 'Claude Code (agent)' }[vm.step.executor];
-  let h = '<h1>' + esc(vm.title) + '</h1><div class="muted">' + ex + (vm.step.description ? ' · ' + esc(vm.step.description) : '') + '</div>';
-  if (vm.scene) h += '<div class="card" style="margin-top:8px"><b>' + esc(vm.scene.code) + '</b> · ' + (vm.scene.seconds ?? '?') + ' s · ' + esc(vm.scene.status) + '<br>' + esc(vm.scene.title) + '</div>';
+  let h = '<h2 style="margin-top:6px">' + esc(vm.step.no + ' ' + vm.step.title) + '</h2><div class="muted">' + ex + (vm.step.description ? ' · ' + esc(vm.step.description) : '') + '</div>';
+  if (vm.blender) {
+    const b = vm.blender;
+    h += '<div class="card" style="margin-top:8px">🧊 <b>Blender</b> <button class="link" data-cmd="openBlender">tab Blender của tập</button>'
+      + (b.shots.length ? '<table style="margin-top:4px"><tr><th>Shot</th><th>File</th><th>Camera</th><th>Frame</th><th>Giây</th><th></th></tr>' + b.shots.map((x) =>
+        '<tr><td>' + esc(x.code) + '</td><td>' + (b.fileAbs[x.file] ? '<a data-open="' + esc(b.fileAbs[x.file]) + '">' + esc(x.file) + '</a>' : esc(x.file)) + '</td><td>' + esc(x.camera || '') + '</td>'
+        + '<td>' + x.start + ' – ' + x.end + (x.conflict ? ' <span class="err">⚠</span>' : '') + ' <span class="badge">' + esc(x.source) + '</span></td><td>' + x.seconds.toFixed(1) + '</td>'
+        + '<td><button class="link" data-cmd="blenderGoto" data-arg="' + esc([x.file, x.start, x.end, x.camera || ''].join('|')) + '">xem trong Blender</button></td></tr>').join('') + '</table>'
+        : ' <span class="muted">chưa có shot nào</span>')
+      + b.issues.map((i) => '<div class="muted">ℹ ' + esc(i) + '</div>').join('') + '</div>';
+  }
   if (!vm.gate.ok) h += '<p class="warn">🔒 Cổng chưa mở: ' + vm.gate.reasons.map(esc).join(' · ') + '</p>';
   $('head').innerHTML = h;
   $('media').innerHTML = renderMedia(vm.media, vm.target.scene);

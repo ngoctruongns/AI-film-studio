@@ -47,6 +47,7 @@ export class Dashboard {
       }
       if (m.type === 'cmd' && m.cmd === 'step') openStep(...(JSON.parse(m.arg) as [string, object]));
       if (m.type === 'cmd' && m.cmd === 'refresh') studio.refresh();
+      if (m.type === 'cmd' && m.cmd === 'blender') vscode.commands.executeCommand('aiFilmStudio.openBlender', { ep: m.arg });
       if (m.type === 'cmd' && m.cmd === 'settings') vscode.commands.executeCommand('aiFilmStudio.openSettings');
       if (m.type === 'cmd' && m.cmd === 'endSession') vscode.commands.executeCommand('aiFilmStudio.endSession');
       if (m.type === 'cmd' && m.cmd === 'grid') vscode.commands.executeCommand('aiFilmStudio.editSceneTable', JSON.parse(m.arg));
@@ -185,7 +186,7 @@ export class Dashboard {
       .map(([k, f]) => `<a data-open="${esc(f)}" data-how="preview">${esc(studio.rel(f).split('/').pop()!)}</a> <span class="muted">(${k})</span>`)
       .join(' · ');
     return `<h2>${ep.id} — phân đoạn × bước <span class="muted">(bấm ô để mở tab bước)</span></h2>
-      <p>${links}</p>
+      <p>${links}${ep.legacy ? '' : ` · <a data-cmd="blender" data-arg="${ep.id}"><b>🧊 Blender của tập</b></a>`}</p>
       ${ep.legacy ? '<p class="warn">Tập này chưa chuyển sang cấu trúc phân đoạn mới.</p>' : ''}
       <div class="scroll-x"><table><tr><th>Mã</th><th>Phân đoạn</th><th>Giây dự kiến / cảnh</th>${SEG_COLUMNS.map((c) => `<th>${c.label}</th>`).join('')}</tr>${rows}</table></div>`;
   }

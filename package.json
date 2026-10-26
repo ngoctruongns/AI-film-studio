@@ -2,7 +2,7 @@
   "name": "ai-film-studio",
   "displayName": "AI Film Studio",
   "description": "Quản lý pipeline làm phim AI: kịch bản → phân đoạn → cảnh → hồ sơ cảnh → prompt ảnh/video. Mỗi việc một tab, chọn model AI cho từng bước, dashboard tiến độ.",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "publisher": "ngoctruongns",
   "license": "UNLICENSED",
   "repository": {
@@ -64,7 +64,7 @@
       },
       {
         "command": "aiFilmStudio.pickStep",
-        "title": "Mở bước…",
+        "title": "Chọn bước nhanh…",
         "category": "AI Film Studio",
         "icon": "$(play)"
       },
@@ -137,6 +137,18 @@
         "title": "Kết thúc phiên (nháp nhật ký STATE)",
         "category": "AI Film Studio",
         "icon": "$(debug-stop)"
+      },
+      {
+        "command": "aiFilmStudio.openBlender",
+        "title": "Blender của tập (file, shot, frame → cảnh)",
+        "category": "AI Film Studio",
+        "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "aiFilmStudio.openTarget",
+        "title": "Mở tab (overview + các bước)",
+        "category": "AI Film Studio",
+        "icon": "$(open-preview)"
       }
     ],
     "menus": {
@@ -174,9 +186,9 @@
       ],
       "view/item/context": [
         {
-          "command": "aiFilmStudio.pickStep",
-          "when": "view == aiFilmStudio.project && viewItem =~ /^(project|episode|segment|scene)$/",
-          "group": "inline@1"
+          "command": "aiFilmStudio.openBlender",
+          "when": "view == aiFilmStudio.project && viewItem == episode",
+          "group": "inline@2"
         },
         {
           "command": "aiFilmStudio.editSceneTable",
@@ -198,6 +210,10 @@
         {
           "command": "aiFilmStudio.runScript",
           "when": "view == aiFilmStudio.project && viewItem =~ /^(episode|segment)$/"
+        },
+        {
+          "command": "aiFilmStudio.pickStep",
+          "when": "view == aiFilmStudio.project && viewItem =~ /^(project|episode|segment|scene)$/"
         }
       ]
     },
@@ -325,6 +341,21 @@
           "type": "object",
           "default": {},
           "description": "Gán model theo bước RIÊNG MÁY NÀY (ghi đè .studio/models.yaml). Ví dụ { \"am-thanh\": \"local-qwen\" }."
+        },
+        "aiFilmStudio.blenderPath": {
+          "type": "string",
+          "default": "",
+          "description": "Blender dòng lệnh trên MÁY NÀY (vd. /usr/bin/blender, C:/Program Files/Blender Foundation/Blender 4.2/blender.exe). Để trống = máy này không chạy Blender."
+        },
+        "aiFilmStudio.blenderHost": {
+          "type": "string",
+          "default": "localhost",
+          "description": "Host của addon MCP for Blender (Blender đang mở, có thể ở máy khác qua cổng chuyển tiếp)."
+        },
+        "aiFilmStudio.blenderPort": {
+          "type": "number",
+          "default": 9876,
+          "description": "Cổng của addon MCP for Blender (giống BLENDER_PORT của blender_bridge.py)."
         }
       }
     }
@@ -333,7 +364,7 @@
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
     "test": "npm run compile && node out/test/smoke.js && node out/test/gui.js",
-    "package": "npx @vscode/vsce package --allow-missing-repository"
+    "package": "npx --yes @vscode/vsce@3 package --allow-missing-repository --skip-license"
   },
   "dependencies": {
     "yaml": "^2.5.0"

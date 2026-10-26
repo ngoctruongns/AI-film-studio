@@ -250,6 +250,8 @@ thư viện) · đọc bảng / mục bằng parser nhỏ tự viết (`src/core
 |---|---|---|
 | ✅ **v0.1** *(26/10/2026)* | P0 đủ + P1 với Claude (Claude Code CLI, Anthropic API) + một phần P2 (cấp mã, `.gitignore`, script, đếm media) — chi tiết `README.md` | thử trên T01 |
 | ✅ **v0.2** *(26/10/2026)* | P1b adapter OpenAI / tương thích / Gemini + **Cài đặt AI dạng GUI** + so sánh 2 model · P2 tab ⑦ kết quả (media, nhập file, sổ `_ket-qua.md`) · P3 bảng cảnh dạng lưới + kết thúc phiên · bộ thử GUI (jsdom) | dùng hằng ngày |
+| ✅ **v0.3** *(26/10/2026)* | 🧊 **Blender của tập**: file .blend ↔ script ↔ hướng dẫn · shot (marker) ↔ frame ↔ cảnh từ 3 nguồn (quét Blender qua socket MCP / dòng lệnh › sổ › hướng dẫn) · sổ `SO-BLENDER.md` · soát frame · thẻ Blender trong tab cảnh + đầu vào ảo cho bước ⑥a | biết ngay cảnh nào render từ file nào, frame nào |
+| ✅ **v0.4** *(27/10/2026)* | Tab theo **đối tượng**: overview + sơ đồ bước bấm được (mặc định bước 1) · **✅ Duyệt / Bỏ duyệt theo cấp** (cảnh · phân đoạn kéo theo cảnh · tập) | không phải gõ ✅ từng chỗ |
 | **P0** — đọc | ProjectModel + parser · cây tập/phân đoạn/cảnh · tab có preview + link mở file · dashboard chỉ đọc · bảng @C/@T · linter cơ bản | nhìn toàn cảnh T01, soát mã |
 | **P1** — AI | settings model + SecretStorage · gán model theo bước · ContextBuilder + ước tính token · chạy ③④⑤ → diff → nhận/bỏ · log chi phí | chạy bước văn bản bằng nhiều model |
 | **P2** — sản xuất | CodeRegistry · ScaffoldService + `.gitignore` · ScriptRunner · MediaIndex + tab kết quả Dreamina · xuất gói điện thoại | quản file, đo số lần sinh |

@@ -91,8 +91,8 @@ export type Scope = 'project' | 'episode' | 'segment' | 'scene';
 export interface FileRef {
   /** Đường dẫn tương đối gốc dự án, có placeholder {episodeDir} {segmentDir} {ep} {T} {X} {scene} */
   path: string;
-  /** Đầu vào ảo (không phải file): git-diff-stat · git-status · runs-today */
-  source?: 'git-diff-stat' | 'git-status' | 'runs-today';
+  /** Đầu vào ảo (không phải file): git-diff-stat · git-status · runs-today · blender-scene (shot / file Blender của cảnh) */
+  source?: 'git-diff-stat' | 'git-status' | 'runs-today' | 'blender-scene';
   /** 'heading:<chữ>' — mục có tiêu đề chứa chữ · 'row:<mã>' — các dòng bảng chứa mã */
   select?: string;
   label?: string;

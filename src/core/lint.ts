@@ -1,6 +1,7 @@
 // Soát nhất quán không cần AI: giây cảnh, trần tập, mã lời, @[TÊN], từ cấm.
 import * as fs from 'fs';
 import { formatDuration } from './markdown';
+import { scanBlender } from './blender';
 import { ProjectModel } from './scanner';
 
 export interface Issue {
@@ -39,6 +40,13 @@ export function lintProject(model: ProjectModel): Issue[] {
     if (refRe && refFile) {
       refs = new Set<string>();
       for (const l of lines(refFile)) for (const m of l.matchAll(refRe)) refs.add(m[1]);
+    }
+
+    // Blender: cảnh cần Blender chưa có frame, frame lệch nguồn, chồng frame → đặt ở dòng cảnh
+    const scenesByCode = new Map(ep.segments.flatMap((s) => s.scenes.map((c) => [c.code, c] as const)));
+    for (const bi of scanBlender(model, ep).issues) {
+      const sc = bi.scene ? scenesByCode.get(bi.scene) : undefined;
+      if (sc) issues.push({ file: sc.file, line: sc.line, severity: bi.severity, message: `Blender: ${bi.message}` });
     }
 
     for (const seg of ep.segments) {

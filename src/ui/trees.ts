@@ -6,12 +6,14 @@ import { StepTarget } from '../core/context';
 import { formatDuration } from '../core/markdown';
 import { Episode, Scene, Segment } from '../core/scanner';
 import { Note } from '../core/notes';
+import { scanBlender } from '../core/blender';
 import { Studio } from './studio';
 
 export type ProjectNode =
   | { kind: 'dashboard' }
   | { kind: 'project' }
   | { kind: 'episode'; ep: Episode }
+  | { kind: 'blender'; ep: Episode }
   | { kind: 'segment'; ep: Episode; seg: Segment }
   | { kind: 'scene'; ep: Episode; seg: Segment; scene: Scene };
 
@@ -40,7 +42,10 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
     const model = this.studio.model;
     if (!model) return [];
     if (!n) return [{ kind: 'dashboard' }, { kind: 'project' }, ...model.episodes.map((ep) => ({ kind: 'episode' as const, ep }))];
-    if (n.kind === 'episode') return n.ep.segments.map((seg) => ({ kind: 'segment' as const, ep: n.ep, seg }));
+    if (n.kind === 'episode') {
+      const segs = n.ep.segments.map((seg) => ({ kind: 'segment' as const, ep: n.ep, seg }));
+      return n.ep.legacy ? segs : [{ kind: 'blender' as const, ep: n.ep }, ...segs];
+    }
     if (n.kind === 'segment') return n.seg.scenes.map((scene) => ({ kind: 'scene' as const, ep: n.ep, seg: n.seg, scene }));
     return [];
   }
@@ -59,20 +64,31 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
         const it = new vscode.TreeItem('Cả dự án (① ý tưởng · ② chia tập)', C.None);
         it.iconPath = new vscode.ThemeIcon('book');
         it.contextValue = 'project';
-        it.command = { command: 'aiFilmStudio.pickStep', title: '', arguments: [n] };
+        it.command = { command: 'aiFilmStudio.openTarget', title: '', arguments: [n] };
         return it;
       }
       case 'episode': {
         const ep = n.ep;
         const live = ep.segments.filter((s) => !s.dropped);
-        const it = new vscode.TreeItem(`${ep.id} ${ep.slug.replace(/-/g, ' ')}`, live.length ? C.Collapsed : C.None);
+        const it = new vscode.TreeItem(`${ep.id} ${ep.slug.replace(/-/g, ' ')}`, live.length || !ep.legacy ? C.Collapsed : C.None);
         it.description = ep.legacy
           ? 'cấu trúc cũ'
           : `${live.length} đoạn · ${live.reduce((a, s) => a + s.scenes.length, 0)} cảnh · ${formatDuration(ep.sceneSeconds)}`;
         it.iconPath = new vscode.ThemeIcon(ep.legacy ? 'archive' : 'device-camera-video');
         it.contextValue = 'episode';
         it.tooltip = `${ep.relDir}${ep.releaseDate ? `\nPhát hành: ${ep.releaseDate.toLocaleDateString('vi-VN')}` : ''}`;
-        it.command = { command: 'aiFilmStudio.pickStep', title: '', arguments: [n] };
+        it.command = { command: 'aiFilmStudio.openTarget', title: '', arguments: [n] };
+        return it;
+      }
+      case 'blender': {
+        const bm = scanBlender(this.studio.model!, n.ep);
+        const it = new vscode.TreeItem('🧊 Blender', C.None);
+        const files = bm.files.filter((f) => !f.shared).length;
+        const warn = bm.issues.filter((i) => i.severity === 'warning').length;
+        it.description = `${files} file · ${bm.shots.length} shot${warn ? ` · ⚠ ${warn}` : ''}`;
+        it.tooltip = 'File .blend, script dựng, shot (marker) → frame → cảnh của tập';
+        it.contextValue = 'blender';
+        it.command = { command: 'aiFilmStudio.openBlender', title: '', arguments: [n] };
         return it;
       }
       case 'segment': {
@@ -82,7 +98,7 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
         it.iconPath = new vscode.ThemeIcon(s.dropped ? 'circle-slash' : 'symbol-namespace');
         it.contextValue = s.dropped ? 'segment-dropped' : 'segment';
         it.tooltip = `${s.relDir ?? '(chưa có thư mục)'}\n${s.statusText}`;
-        if (!s.dropped) it.command = { command: 'aiFilmStudio.pickStep', title: '', arguments: [n] };
+        if (!s.dropped) it.command = { command: 'aiFilmStudio.openTarget', title: '', arguments: [n] };
         return it;
       }
       case 'scene': {
@@ -94,7 +110,7 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
           `**${c.code}** — ${c.status ? STATUS_LABEL[c.status] : '?'}\n\n${c.title}\n\nVideo AI đã sinh: ${v}`,
         );
         it.contextValue = 'scene';
-        it.command = { command: 'aiFilmStudio.pickStep', title: '', arguments: [n] };
+        it.command = { command: 'aiFilmStudio.openTarget', title: '', arguments: [n] };
         return it;
       }
     }

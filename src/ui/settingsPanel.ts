@@ -73,6 +73,9 @@ async function vm(studio: Studio, models: ModelRegistry) {
     maxInputTokens: s.get<number>('maxInputTokens') ?? 60000,
     claudePath: s.get<string>('claudePath') ?? '',
     claudeFound: models.claudeCli(),
+    blenderPath: s.get<string>('blenderPath') ?? '',
+    blenderHost: s.get<string>('blenderHost') ?? 'localhost',
+    blenderPort: s.get<number>('blenderPort') ?? 9876,
     providers: PROVIDERS,
     models: list,
     keys,
@@ -103,15 +106,29 @@ async function handle(m: any, studio: Studio, models: ModelRegistry, panel: vsco
     case 'ready':
       return;
     case 'setting': {
-      const allowed = ['projectRoot', 'mediaRoot', 'machineProfile', 'maxInputTokens', 'claudePath'];
+      const allowed = ['projectRoot', 'mediaRoot', 'machineProfile', 'maxInputTokens', 'claudePath', 'blenderPath', 'blenderHost', 'blenderPort'];
       if (!allowed.includes(m.key)) return;
-      await s.update(m.key, m.key === 'maxInputTokens' ? Number(m.value) || 60000 : String(m.value ?? '').trim(), G);
+      const num = m.key === 'maxInputTokens' || m.key === 'blenderPort';
+      await s.update(m.key, num ? Number(m.value) || (m.key === 'blenderPort' ? 9876 : 60000) : String(m.value ?? '').trim(), G);
       return;
     }
     case 'cmd':
       switch (m.cmd) {
         case 'pickRoot':
           return vscode.commands.executeCommand('aiFilmStudio.setProjectRoot');
+        case 'pickBlender': {
+          const pick = await vscode.window.showOpenDialog({ canSelectFiles: true, canSelectFolders: false, openLabel: 'Chọn file chạy Blender của máy này' });
+          if (pick?.[0]) await s.update('blenderPath', pick[0].fsPath, G);
+          return;
+        }
+        case 'testBlender':
+          try {
+            const out = await vscode.commands.executeCommand<string>('aiFilmStudio.blenderPing');
+            panel.webview.postMessage({ type: 'test', id: '__blender', text: `✅ ${out}` });
+          } catch (e: any) {
+            panel.webview.postMessage({ type: 'test', id: '__blender', text: `❌ ${e.message}` });
+          }
+          return;
         case 'pickMedia': {
           const pick = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, openLabel: 'Chọn thư mục media của máy này' });
           if (pick?.[0]) await s.update('mediaRoot', pick[0].fsPath, G);
@@ -278,7 +295,9 @@ function render() {
     row('Thư mục media (máy này)', '<input data-setting="mediaRoot" size="50" value="' + esc(vm.mediaRoot) + '" placeholder="' + esc(vm.mediaDefault) + '"> <button class="sec" data-cmd="pickMedia">Chọn…</button>', 'trống = ' + esc(vm.mediaDefault || '(theo project.yaml)')) +
     row('Tên máy', '<input data-setting="machineProfile" size="20" value="' + esc(vm.machine) + '" placeholder="laptop / cong-ty">', 'ghi vào nhật ký chạy') +
     row('Trần token một lần chạy', '<input data-setting="maxInputTokens" type="number" value="' + vm.maxInputTokens + '">', 'vượt thì hỏi lại') +
-    row('Claude CLI', '<input data-setting="claudePath" size="50" value="' + esc(vm.claudePath) + '" placeholder="tự tìm">', 'đang dùng: <code>' + esc(vm.claudeFound) + '</code>');
+    row('Claude CLI', '<input data-setting="claudePath" size="50" value="' + esc(vm.claudePath) + '" placeholder="tự tìm">', 'đang dùng: <code>' + esc(vm.claudeFound) + '</code>') +
+    row('Blender đang mở (addon MCP)', '<input data-setting="blenderHost" size="16" value="' + esc(vm.blenderHost) + '"> : <input data-setting="blenderPort" type="number" style="width:80px" value="' + vm.blenderPort + '"> <button class="sec" data-cmd="testBlender">Thử</button> <span id="t-__blender" class="muted">' + esc(tests.__blender || '') + '</span>', 'cùng cổng với blender_bridge.py') +
+    row('Blender dòng lệnh (máy này)', '<input data-setting="blenderPath" size="50" value="' + esc(vm.blenderPath) + '" placeholder="trống = máy này không có Blender"> <button class="sec" data-cmd="pickBlender">Chọn…</button>', 'để quét / render file .blend trong repo ở chế độ nền');
 
   const prov = (id) => vm.providers.find((p) => p.id === id) || { label: id };
   $('models').innerHTML = vm.models.length ? '<table><tr><th></th><th>Tên</th><th>Nhà cung cấp</th><th>Model</th><th>Giá USD/1M (vào/ra)</th><th>Khóa API</th><th></th></tr>' +

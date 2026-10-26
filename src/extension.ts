@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { Scope } from './core/config';
 import { StepTarget } from './core/context';
 import { registerCommands } from './ui/commands';
+import { BlenderPanel, blenderSocket } from './ui/blenderPanel';
 import { Dashboard } from './ui/dashboard';
 import { GridPanel } from './ui/gridPanel';
 import { ModelRegistry } from './ui/models';
@@ -51,6 +52,10 @@ export function activate(context: vscode.ExtensionContext): void {
   reg('aiFilmStudio.openDashboard', () => Dashboard.show(studio, openStep));
   reg('aiFilmStudio.openSettings', () => SettingsPanel.show(studio, models));
   reg('aiFilmStudio.openStep', openStep);
+  reg('aiFilmStudio.openTarget', (node?: ProjectNode) => {
+    if (!studio.config) return vscode.window.showWarningMessage(studio.error ?? 'Chưa nạp dự án.');
+    StepPanel.open(studio, models, undefined, nodeTarget(node).target);
+  });
   reg('aiFilmStudio.pickStep', async (node?: ProjectNode) => {
     if (!studio.config) return vscode.window.showWarningMessage(studio.error ?? 'Chưa nạp dự án.');
     const { scope, target } = nodeTarget(node);
@@ -85,6 +90,19 @@ export function activate(context: vscode.ExtensionContext): void {
       seg = p.s;
     }
     GridPanel.open(studio, ep, seg);
+  });
+  reg('aiFilmStudio.openBlender', async (arg?: ProjectNode | { ep?: string }) => {
+    let ep = arg && 'kind' in arg ? ('ep' in arg ? arg.ep.id : undefined) : arg?.ep;
+    if (!ep) {
+      const eps = (studio.model?.episodes ?? []).filter((e) => !e.legacy);
+      const p = eps.length === 1 ? { e: eps[0].id } : await vscode.window.showQuickPick(eps.map((e) => ({ label: e.id, description: e.slug, e: e.id })), { placeHolder: 'Blender của tập nào?' });
+      ep = p?.e;
+    }
+    if (ep) BlenderPanel.open(studio, ep);
+  });
+  reg('aiFilmStudio.blenderPing', async () => {
+    const out = await blenderSocket(studio, "import bpy\nprint('AFS_OK:' + bpy.app.version_string + ' | ' + (bpy.data.filepath or '(chưa lưu)'))");
+    return /AFS_OK:(.*)/.exec(out)?.[1]?.trim() ?? out.trim();
   });
   reg('aiFilmStudio.endSession', () => {
     if (!studio.config?.pipeline.steps.some((s) => s.id === 'ket-thuc-phien')) {

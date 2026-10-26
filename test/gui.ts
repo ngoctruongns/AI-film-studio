@@ -4,6 +4,7 @@
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 const Module = require('module');
@@ -40,7 +41,7 @@ async function waitFor(fn: () => any, msg: string, ms = 4000) {
 // ------------------------------------------------------------------ bản sao dự án
 function copyProject(): string {
   const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'afs-gui-'));
-  const keep = /(\.(md|ya?ml|json|py|txt)|\.gitignore)$/i;
+  const keep = /(\.(md|ya?ml|json|py|txt|sh|bat)|\.gitignore)$/i;
   const skipDir = new Set(['.git', 'node_modules', 'pdf-sach', 'runs', 'anh-tham-khao', '_gis']);
   const toolRel = path.relative(SRC, TOOL);
   fs.cpSync(SRC, dst, {
@@ -54,6 +55,13 @@ function copyProject(): string {
       return keep.test(src) && st.size < 2_000_000;
     },
   });
+  // .blend nặng không chép — tạo file rỗng cùng tên để tool thấy
+  for (const d of ['04_PRODUCTION/EPISODES/EP01_Nuoc-Mat/blender', '04_PRODUCTION/BLENDER/thu_vien', '04_PRODUCTION/BLENDER/scenes']) {
+    const from = path.join(SRC, d);
+    if (!fs.existsSync(from)) continue;
+    fs.mkdirSync(path.join(dst, d), { recursive: true });
+    for (const f of fs.readdirSync(from)) if (f.endsWith('.blend')) fs.writeFileSync(path.join(dst, d, f), '');
+  }
   execFileSync('git', ['init', '-q'], { cwd: dst });
   execFileSync('git', ['add', '-A'], { cwd: dst });
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base'], { cwd: dst });
@@ -81,6 +89,37 @@ function fakeLlm(): Promise<{ port: number; close: () => void }> {
   return new Promise((r) => server.listen(0, () => r({ port: (server.address() as any).port, close: () => server.close() })));
 }
 
+// ------------------------------------------------------------------ Blender giả (giao thức addon MCP for Blender)
+const blenderCodes: string[] = [];
+function fakeBlender(): Promise<{ port: number; close: () => void }> {
+  const markers = [['F01', 0], ['F01_2', 60], ['F02', 140], ['F03', 228], ['F04', 372], ['F05', 480], ['F06', 600], ['F07', 720], ['F36', 816], ['F08', 984], ['F09', 1104]];
+  const dump = {
+    file: 'D:/video/LS600/tran_da_bang.blend', blender: '4.2.3', scene: 'Scene', fps: 24, frame_start: 0, frame_end: 1248,
+    resolution: [1280, 720, 100], engine: 'BLENDER_EEVEE_NEXT', output: '//render/', camera: 'CAM_F01',
+    markers: markers.map(([name, frame]) => ({ name, frame, camera: `CAM_${name}` })), cameras: markers.map(([n]) => `CAM_${n}`),
+  };
+  const server = net.createServer((sock) => {
+    let buf = '';
+    sock.on('data', (d) => {
+      buf += d;
+      let req: any;
+      try {
+        req = JSON.parse(buf);
+      } catch {
+        return;
+      }
+      const code: string = req.params?.code ?? '';
+      blenderCodes.push(code);
+      const out = code.includes('AFS_JSON') ? 'AFS_JSON:' + JSON.stringify(dump) + '\n' : 'AFS_OK:4.2.3 | D:/video/LS600/tran_da_bang.blend\n';
+      // gửi làm hai mảnh để thử ghép gói
+      const msg = JSON.stringify({ status: 'success', result: { result: out } });
+      sock.write(msg.slice(0, 40));
+      setTimeout(() => sock.write(msg.slice(40)), 10);
+    });
+  });
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ port: (server.address() as any).port, close: () => server.close() })));
+}
+
 async function main() {
   const root = copyProject();
   const media = path.join(root, '04_PRODUCTION/VIDEO_OUT/EP01/K');
@@ -93,6 +132,9 @@ async function main() {
   console.log(`Bản sao dự án: ${root}`);
 
   const llm = await fakeLlm();
+  const bl = await fakeBlender();
+  V.settingsStore['aiFilmStudio.blenderHost'] = '127.0.0.1';
+  V.settingsStore['aiFilmStudio.blenderPort'] = bl.port;
   V.setWorkspaceRoot(root);
   V.settingsStore['aiFilmStudio.models'] = [
     { id: 'claude-code', provider: 'claude-code' },
@@ -111,7 +153,7 @@ async function main() {
   ok(roots.length > 3, `gốc cây có ${roots.length} mục`);
   const ep1 = roots.find((n: any) => n.kind === 'episode' && n.ep.id === 'EP01');
   ok(ep1, 'có EP01');
-  const segs = tree.getChildren(ep1);
+  const segs = tree.getChildren(ep1).filter((n: any) => n.kind === 'segment');
   ok(segs.length >= 10, `EP01 có ${segs.length} phân đoạn`);
   const kNode = segs.find((n: any) => n.seg.code === 'K');
   ok(tree.getChildren(kNode).length >= 10, `K có ${tree.getChildren(kNode).length} cảnh`);
@@ -133,6 +175,8 @@ async function main() {
 
   console.log('\n[3] Tab bước ④ Chia cảnh · EP01·K (model fake)');
   await step.settle();
+  await waitFor(() => step.$$('#stepper .st').length === 5, `sơ đồ bước phân đoạn: ${step.$$('#stepper .st').map((b) => b.textContent).join(' → ')}`);
+  ok(step.$('#stepper .st.cur')?.dataset.step === 'chia-canh', 'bấm ô dashboard → tab phân đoạn K, chọn sẵn ④');
   await waitFor(() => step.$$('#files tr').length >= 5, `bảng file: ${step.$$('#files tr').length} dòng`);
   ok(step.$('#head')!.textContent!.includes('Cổng chưa mở'), 'cổng đóng (README K chưa ✅)');
   ok(step.$('#est')!.textContent!.includes('token'), `ước tính: ${step.$('#est')!.textContent}`);
@@ -264,11 +308,110 @@ async function main() {
   await V.commands.executeCommand('aiFilmStudio.startWork');
   ok(execFileSync('git', ['diff', '--stat'], { cwd: root, encoding: 'utf8' }).trim() === '', 'Bắt đầu việc → git add -A');
 
+  console.log('\n[11] Blender của tập');
+  const epKids = tree.getChildren(ep1);
+  ok(epKids[0].kind === 'blender', 'nút 🧊 Blender đầu danh sách của EP01');
+  const bItem = tree.getTreeItem(epKids[0]);
+  ok(/file · \d+ shot/.test(bItem.description), `cây: ${bItem.description}`);
+  await V.commands.executeCommand('aiFilmStudio.openBlender', epKids[0]);
+  const bp = V.panels.find((p) => p.viewType === 'aiFilmStudio.blender')!;
+  await bp.settle();
+  await waitFor(() => bp.$$('#files tr').length >= 6, `bảng file .blend: ${bp.$$('#files tr').length - 1} file`);
+  ok(bp.$('#files')!.textContent!.includes('dựng tại máy'), 'ban_do_dai_ngu.blend: dựng tại máy (.sh/.bat)');
+  const shotRows = () => bp.$$('#shots tr').filter((r) => r.querySelector('td'));
+  ok(shotRows().length >= 38, `shot từ hướng dẫn: ${shotRows().length}`);
+  ok(bp.$('#shots')!.textContent!.includes('CAM_E01_2'), 'shot E01_2 lấy mã từ tên camera');
+  (bp.$('[data-cmd="scanSocket"]') as HTMLElement).click();
+  await bp.settle(15);
+  await waitFor(() => bp.$('#status')!.textContent!.includes('✅'), `quét Blender đang mở: ${bp.$('#status')!.textContent}`);
+  ok(fs.existsSync(path.join(root, '.studio/blender/EP01/tran_da_bang.json')), 'lưu .studio/blender/EP01/tran_da_bang.json');
+  await bp.settle();
+  const f02 = shotRows().find((r) => r.children[1]?.textContent === 'F02')!;
+  ok(f02?.textContent!.includes('140 – 227') && f02.textContent!.includes('⚠'), `F02 theo Blender 140–227, ⚠ lệch hướng dẫn 132`);
+  ok(bp.$('#issues')!.textContent!.includes('F02'), 'mục "Cần xem" báo F02 lệch');
+  V.answers.push({ kind: 'info', value: 'Ghi' });
+  (bp.$('[data-cmd="writeRegister"]') as HTMLElement).click();
+  await bp.settle(10);
+  const reg = path.join(root, '04_PRODUCTION/EPISODES/EP01_Nuoc-Mat/blender/SO-BLENDER.md');
+  ok(fs.existsSync(reg) && /\| F02 \| F02 \| tran_da_bang.blend \| CAM_F02 \| 140 – 227 \|/.test(fs.readFileSync(reg, 'utf8')), 'ghi sổ SO-BLENDER.md');
+  // người ghi chú trong sổ → ghi lại sổ không mất
+  fs.writeFileSync(reg, fs.readFileSync(reg, 'utf8').replace(/(\| F03 \| F03 \|.*\|)\s+\|\n/, '$1 ghi chú của Trường |\n'));
+  V.commands.executeCommand('aiFilmStudio.refresh');
+  await bp.settle();
+  V.answers.push({ kind: 'info', value: 'Ghi' });
+  (bp.$('[data-cmd="writeRegister"]') as HTMLElement).click();
+  await bp.settle(10);
+  ok(fs.readFileSync(reg, 'utf8').includes('ghi chú của Trường'), 'ghi lại sổ giữ cột Ghi chú');
+  // bảng đã vẽ lại sau khi ghi sổ → tìm lại dòng F02
+  (shotRows().find((r) => r.children[1]?.textContent === 'F02')!.querySelector('[data-cmd="goto"]') as HTMLElement).click();
+  await bp.settle(10);
+  ok(blenderCodes.some((c) => c.includes('frame_preview_start = 140') && c.includes('CAM_F02')), 'xem trong Blender → preview range 140 + CAM_F02');
+  V.commands.executeCommand('aiFilmStudio.openStep', 'blender', { ep: 'EP01', seg: 'F', scene: 'F02' });
+  const bs = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
+  await bs.settle();
+  await waitFor(() => bs.$('#head')!.textContent!.includes('CAM_F02'), 'tab ⑥a F02 có thẻ Blender');
+  ok(bs.$('#files')!.textContent!.includes('Blender của F02'), 'đầu vào ảo "Blender của F02" cho Claude Code');
+  const sp = V.panels.find((p) => p.viewType === 'aiFilmStudio.settings')!;
+  (sp.$('[data-cmd="testBlender"]') as HTMLElement).click();
+  await sp.settle(10);
+  await waitFor(() => sp.$('#t-__blender')?.textContent?.includes('4.2.3'), `Cài đặt → thử Blender: ${sp.$('#t-__blender')?.textContent}`);
+
+  console.log('\n[12] Bấm cây → tab overview · duyệt theo cấp');
+  const segI = segs.find((n: any) => n.seg.code === 'I');
+  const itemI = tree.getTreeItem(segI);
+  ok(itemI.command?.command === 'aiFilmStudio.openTarget', 'bấm phân đoạn trong cây → mở tab (không hỏi chọn bước)');
+  await V.commands.executeCommand(itemI.command.command, ...(itemI.command.arguments ?? []));
+  const pI = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
+  await pI.settle();
+  await waitFor(() => pI.$('#overview h1')?.textContent?.startsWith('I ·'), `overview: ${pI.$('#overview h1')?.textContent}`);
+  ok(pI.$('#stepper .st.cur')?.dataset.step === 'kich-ban', 'mở lần đầu → bước 1 (③ Kịch bản)');
+  ok(pI.$('#head h2')?.textContent?.includes('Kịch bản'), 'nội dung bước 1 hiện ngay dưới');
+  (pI.$('[data-step="loi"]') as HTMLElement).click();
+  await pI.settle();
+  await waitFor(() => pI.$('#stepper .st.cur')?.dataset.step === 'loi' && pI.$('#head h2')!.textContent!.includes('Lời'), 'bấm ⑤a trên sơ đồ → hiện bước Lời');
+  // duyệt phân đoạn K → dòng K ở README + mọi cảnh K
+  const kp = V.panels.find((p) => p.viewType === 'aiFilmStudio.step' && p.title.includes('EP01·K') && !p.title.includes('K0'))!;
+  ok(kp.$('[data-approve="do"]')?.textContent?.includes('Duyệt phân đoạn K'), 'nút "✅ Duyệt phân đoạn K"');
+  V.answers.push({ kind: 'info', value: 'Duyệt' });
+  (kp.$('[data-approve="do"]') as HTMLElement).click();
+  await kp.settle(10);
+  const readme = fs.readFileSync(path.join(root, '04_PRODUCTION/EPISODES/EP01_Nuoc-Mat/README.md'), 'utf8');
+  const kRow = readme.split('\n').find((l) => /^\|\s*\d+\s*\|\s*\*\*K\*\*/.test(l)) ?? '';
+  ok(/\|\s*✅[^|]*\|\s*$/.test(kRow), `README dòng K → ✅`);
+  const kText = fs.readFileSync(kFile, 'utf8');
+  const kStatuses = kText.split('\n').filter((l) => /^\|\s*\*\*K\d\d\*\*/.test(l)).map((l) => l.trim().split('|').slice(-2)[0].trim());
+  ok(kStatuses.length >= 11 && kStatuses.every((x) => x.startsWith('✅') || x.startsWith('❌')), `mọi cảnh K → ✅ (${kStatuses.length} dòng)`);
+  await waitFor(() => kp.$('#overview')!.textContent!.includes('đã duyệt'), 'overview: "phân đoạn K đã duyệt" + nút Bỏ duyệt');
+  (kp.$('[data-step="chia-canh"]') as HTMLElement).click();
+  await kp.settle();
+  await waitFor(() => kp.$('#head h2')?.textContent?.includes('Chia cảnh') && !kp.$('#head')!.textContent!.includes('Cổng chưa mở'), 'cổng ④ mở sau khi duyệt');
+  // duyệt riêng một cảnh: chỉ dòng đó
+  const jFile = path.join(path.dirname(kFile), '..', fs.readdirSync(path.join(path.dirname(kFile), '..')).find((d) => d.startsWith('J_'))!, 'J_canh.md');
+  const jBefore = fs.readFileSync(jFile, 'utf8');
+  V.commands.executeCommand('aiFilmStudio.openTarget', { kind: 'scene', ep: ep1.ep, seg: ep1.ep.segments.find((x: any) => x.code === 'J'), scene: ep1.ep.segments.find((x: any) => x.code === 'J').scenes.find((c: any) => c.code === 'J02') });
+  const jp = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
+  await jp.settle();
+  await waitFor(() => jp.$('[data-approve="do"]')?.textContent?.includes('cảnh J02'), 'tab cảnh J02: nút "✅ Duyệt cảnh J02"');
+  ok(jp.$$('#stepper .st').length === 4 && jp.$('#stepper .st.cur')?.dataset.step === 'prompt', `sơ đồ bước cảnh: ${jp.$$('#stepper .st').map((b) => b.textContent).join(' → ')}`);
+  V.answers.push({ kind: 'info', value: 'Duyệt' });
+  (jp.$('[data-approve="do"]') as HTMLElement).click();
+  await jp.settle(10);
+  const jAfter = fs.readFileSync(jFile, 'utf8');
+  const diff = jAfter.split('\n').filter((l, i) => l !== jBefore.split('\n')[i]);
+  ok(diff.length === 1 && diff[0].includes('J02') && /✅/.test(diff[0]), 'duyệt cảnh → chỉ đúng 1 dòng J02 đổi');
+  await jp.settle();
+  await waitFor(() => jp.$('[data-approve="undo"]'), 'cảnh J02 hiện "Bỏ duyệt"');
+  V.answers.push({ kind: 'info', value: 'Bỏ duyệt' });
+  (jp.$('[data-approve="undo"]') as HTMLElement).click();
+  await jp.settle(10);
+  ok(/J02[^\n]*👀 chờ duyệt/.test(fs.readFileSync(jFile, 'utf8')), 'bỏ duyệt → 👀 chờ duyệt');
+
   console.log('\n[10] Lỗi JS trong webview');
   for (const p of V.panels) await p.settle();
   ok(V.errors.length === 0, V.errors.length ? V.errors.join('\n    ') : 'không có lỗi');
 
   llm.close();
+  bl.close();
   console.log(`\n${failed ? `❌ ${failed} kiểm tra hỏng` : '✅ tất cả đạt'} · bản sao: ${root}`);
   process.exit(failed ? 1 : 0);
 }

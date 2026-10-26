@@ -82,6 +82,18 @@ gitignore:
   - '*.psd'
   - '*.blend1'
 
+# Blender của từng tập (tab 🧊 Blender). Marker trên timeline = mã shot (A01, A01_2…), camera = CAM_<shot>.
+blender:
+  dirs: ['{episodeDir}/blender']
+  sharedDirs: []
+  scripts: ['{episodeDir}/blender_script']
+  guides: ['{episodeDir}/blender']
+  register: '{episodeDir}/blender/SO-BLENDER.md'
+  fps: 24
+  cameraPrefix: CAM_
+  methods: [V2, BL]
+  methodColumn: Cách
+
 coreContext:
   - path: README.md
     maxChars: 6000
