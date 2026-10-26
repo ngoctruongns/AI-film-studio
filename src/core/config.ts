@@ -36,6 +36,8 @@ export interface ProjectConfig {
   paths: {
     episodes: string;
     media?: string;
+    /** Thư mục media phụ trong repo, quét thêm theo mã cảnh (vd. '{episodeDir}/seedance_clip') */
+    sceneMedia?: string[];
   };
   episode: {
     dirPattern: string;
@@ -55,7 +57,8 @@ export interface ProjectConfig {
     /** Thư mục mẫu của một phân đoạn (trong template tập), mã mẫu là 'A' */
     template?: string;
   };
-  sceneTable: TableSpec & { minSeconds?: number; maxSeconds?: number };
+  /** suggest: gợi ý cho ô của lưới bảng cảnh — tên cột → danh sách giá trị */
+  sceneTable: TableSpec & { minSeconds?: number; maxSeconds?: number; suggest?: Record<string, string[]> };
   codes: {
     segment: string;
     scene: string;
@@ -88,6 +91,8 @@ export type Scope = 'project' | 'episode' | 'segment' | 'scene';
 export interface FileRef {
   /** Đường dẫn tương đối gốc dự án, có placeholder {episodeDir} {segmentDir} {ep} {T} {X} {scene} */
   path: string;
+  /** Đầu vào ảo (không phải file): git-diff-stat · git-status · runs-today */
+  source?: 'git-diff-stat' | 'git-status' | 'runs-today';
   /** 'heading:<chữ>' — mục có tiêu đề chứa chữ · 'row:<mã>' — các dòng bảng chứa mã */
   select?: string;
   label?: string;
@@ -112,7 +117,10 @@ export interface StepSpec {
   executor: 'human' | 'chat' | 'agent';
   description?: string;
   inputs?: FileRef[];
-  output?: FileRef & { mode?: 'replace' | 'section' };
+  /** replace = cả file · section = thay mục 'heading:…' · insert = chèn ngay dưới tiêu đề mục (sau dòng trích dẫn) */
+  output?: FileRef & { mode?: 'replace' | 'section' | 'insert' };
+  /** Phần giao diện thêm trong tab: media = lưới ảnh/clip + ghi kết quả · grid = nút sửa bảng cảnh dạng lưới */
+  view?: ('media' | 'grid')[];
   gate?: StepGate;
   /** Đường dẫn mẫu prompt, tương đối thư mục .studio/ */
   prompt?: string;

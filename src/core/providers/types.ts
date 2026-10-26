@@ -42,15 +42,6 @@ export interface Provider {
   complete(req: ChatRequest): Promise<ChatResult>;
 }
 
-export class NotImplementedProvider implements Provider {
-  loadsProjectInstructions = false;
-  needsKey = true;
-  constructor(public id: ProviderId) {}
-  async complete(): Promise<ChatResult> {
-    throw new Error(`Provider "${this.id}" mới có khung, chưa làm (pha P1b). Dùng Claude trước.`);
-  }
-}
-
 export function estimateCost(m: ModelConfig, input: number, output: number): number | undefined {
   if (!m.price) return undefined;
   return (input * (m.price.input ?? 0) + output * (m.price.output ?? 0)) / 1e6;

@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ProjectConfig, StatusKey, StudioConfig, parseStatus } from './config';
 import { columnIndex, findTable, isStruck, parseSeconds, parseTables, stripMd } from './markdown';
+import { SceneResult, parseResults } from './results';
 
 export interface Scene {
   code: string;
@@ -17,6 +18,8 @@ export interface Scene {
   line: number;
   /** số file media theo loại: V (video AI), I (ảnh), R (tham chiếu), L (lời), A (âm) */
   media: Record<string, number>;
+  /** dòng của cảnh trong sổ <X>_ket-qua.md (bước ⑦) */
+  result?: SceneResult;
 }
 
 export interface Segment {
@@ -251,7 +254,11 @@ export function scanProject(config: StudioConfig, mediaRootOverride?: string): P
       const sceneText = readIf(sceneFile);
       const info = segInfo.get(code);
       const scenes = sceneText ? parseScenes(sceneText, sceneFile!, code, p) : [];
-      for (const sc of scenes) sc.media = media.get(`${id}_${sc.code}`) ?? {};
+      const results = sfiles['ket-qua'] ? parseResults(readIf(sfiles['ket-qua']) ?? '') : undefined;
+      for (const sc of scenes) {
+        sc.media = media.get(`${id}_${sc.code}`) ?? {};
+        sc.result = results?.get(sc.code);
+      }
       segments.push({
         code,
         slug: sm[2],

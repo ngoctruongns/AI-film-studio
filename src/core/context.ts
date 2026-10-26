@@ -1,8 +1,10 @@
 // Ghép ngữ cảnh cho một bước: giải đường dẫn, kiểm cổng, dựng prompt, ước tính token, ghép kết quả vào file.
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileRef, STUDIO_DIR, StatusKey, StepSpec, STATUS_LABEL, parseStatus } from './config';
 import { applySelect, columnIndex, findSection, findTable, replaceSection, stripMd } from './markdown';
+import { readRuns } from './runs';
 import { Placeholders, ProjectModel, fill, findEpisode, findScene, findSegment, placeholdersFor } from './scanner';
 
 export interface StepTarget {
@@ -22,6 +24,34 @@ export interface ResolvedFile {
   found: boolean;
   line: number;
   text?: string;
+  /** đầu vào ảo (git, nhật ký chạy) — không có file để mở */
+  virtual?: boolean;
+}
+
+function git(root: string, args: string[]): string {
+  try {
+    return execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  } catch (e: any) {
+    return `(git lỗi: ${String(e.message).slice(0, 200)})`;
+  }
+}
+
+function virtualSource(model: ProjectModel, src: NonNullable<FileRef['source']>): { label: string; text: string } {
+  const root = model.config.root;
+  switch (src) {
+    case 'git-diff-stat':
+      return { label: 'git diff --stat (chưa stage)', text: git(root, ['diff', '--stat']) || '(không có thay đổi chưa stage)' };
+    case 'git-status':
+      return { label: 'git status --short', text: git(root, ['status', '--short']) || '(sạch)' };
+    case 'runs-today': {
+      const today = new Date().toISOString().slice(0, 10);
+      const runs = readRuns(root).filter((r) => r.startedAt.startsWith(today));
+      const text = runs.length
+        ? runs.map((r) => `- ${r.startedAt.slice(11, 16)} · ${r.step} · ${r.target} · ${r.modelId} · ${r.status}${r.outputFile ? ' → ' + r.outputFile : ''}`).join('\n')
+        : '(hôm nay chưa chạy AI qua tool)';
+      return { label: 'Các lần chạy AI hôm nay', text };
+    }
+  }
 }
 
 export interface GateResult {
@@ -44,6 +74,11 @@ export function targetKey(t: StepTarget): string {
 }
 
 export function resolveRef(model: ProjectModel, ref: FileRef, ph: Placeholders, role: 'input' | 'output'): ResolvedFile {
+  if (ref.source) {
+    const v = virtualSource(model, ref.source);
+    const text = ref.maxChars && v.text.length > ref.maxChars ? v.text.slice(0, ref.maxChars) + '\n…(cắt bớt)' : v.text;
+    return { ref, role, label: ref.label ?? v.label, abs: '', rel: `(${ref.source})`, exists: true, found: true, line: 0, text, virtual: true };
+  }
   const relPath = fill(ref.path, ph);
   const abs = path.isAbsolute(relPath) ? relPath : path.join(model.config.root, relPath);
   const exists = fs.existsSync(abs) && fs.statSync(abs).isFile();
@@ -177,8 +212,16 @@ export function extractOutput(answer: string): string {
 export function mergeOutput(rs: ResolvedStep, newContent: string): string {
   const out = rs.output!;
   const full = out.exists ? fs.readFileSync(out.abs, 'utf8') : '';
-  if (rs.step.output?.mode !== 'section' || !out.ref.select?.startsWith('heading:')) return newContent;
+  const mode = rs.step.output?.mode ?? 'replace';
+  if (mode === 'replace' || !out.ref.select?.startsWith('heading:')) return newContent;
   const sec = findSection(full, out.ref.select.slice('heading:'.length));
+  if (mode === 'insert' && sec) {
+    // chèn ngay dưới tiêu đề mục, sau các dòng trống / trích dẫn '>' đi liền tiêu đề
+    const lines = full.split(/\r?\n/);
+    let at = sec.start + 1;
+    while (at < sec.end && (lines[at].trim() === '' || lines[at].trim().startsWith('>'))) at++;
+    return [...lines.slice(0, at), ...newContent.replace(/\s+$/, '').split('\n'), '', ...lines.slice(at)].join('\n');
+  }
   if (sec) return replaceSection(full, sec, newContent);
   return (full.replace(/\s*$/, '') + '\n\n' + newContent).replace(/^\s+/, '');
 }

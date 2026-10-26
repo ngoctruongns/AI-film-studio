@@ -16,6 +16,7 @@ const SEG_COLUMNS: { step: string; label: string; file?: string }[] = [
   { step: 'am-thanh', label: '⑤b Âm', file: 'am-thanh' },
   { step: 'dung', label: '⑤c Dựng', file: 'dung' },
   { step: 'prompt', label: '⑤d Prompt', file: 'prompt' },
+  { step: 'ket-qua', label: '⑦ Kết quả', file: 'ket-qua' },
 ];
 
 export class Dashboard {
@@ -46,6 +47,9 @@ export class Dashboard {
       }
       if (m.type === 'cmd' && m.cmd === 'step') openStep(...(JSON.parse(m.arg) as [string, object]));
       if (m.type === 'cmd' && m.cmd === 'refresh') studio.refresh();
+      if (m.type === 'cmd' && m.cmd === 'settings') vscode.commands.executeCommand('aiFilmStudio.openSettings');
+      if (m.type === 'cmd' && m.cmd === 'endSession') vscode.commands.executeCommand('aiFilmStudio.endSession');
+      if (m.type === 'cmd' && m.cmd === 'grid') vscode.commands.executeCommand('aiFilmStudio.editSceneTable', JSON.parse(m.arg));
     });
     render();
   }
@@ -63,8 +67,11 @@ export class Dashboard {
     // ----- tổng
     const allScenes = live.flatMap((e) => e.segments.filter((s) => !s.dropped).flatMap((s) => s.scenes)).filter((c) => c.status !== 'dropped');
     const done = allScenes.filter((c) => c.status === 'done').length;
-    const withV = allScenes.filter((c) => (c.media['V'] ?? 0) > 0);
-    const avgV = withV.length ? withV.reduce((a, c) => a + c.media['V'], 0) / withV.length : undefined;
+    // số lần sinh: ưu tiên sổ kết quả (người ghi), không có thì đếm file _V trong thư mục media
+    const attempts = (c: (typeof allScenes)[number]) => c.result?.attempts ?? c.media['V'] ?? 0;
+    const withV = allScenes.filter((c) => attempts(c) > 0);
+    const avgV = withV.length ? withV.reduce((a, c) => a + attempts(c), 0) / withV.length : undefined;
+    const chosen = allScenes.filter((c) => c.result?.chosen).length;
     const runs = studio.root ? readRuns(studio.root) : [];
     const month = new Date(now.getFullYear(), now.getMonth(), 1);
     const costMonth = summarizeCost(runs, month);
@@ -79,7 +86,7 @@ export class Dashboard {
     const tiles = `<div class="row">
       ${tile('Tập đã vào cấu trúc mới', `${live.length} / ${model.episodes.length}`)}
       ${tile('Cảnh duyệt ✅', `${done} / ${allScenes.length}`, allScenes.length ? `${Math.round((done / allScenes.length) * 100)}%` : '')}
-      ${tile('Lần sinh video / cảnh', avgV !== undefined ? avgV.toFixed(1) : '—', model.mediaFound ? `${withV.length} cảnh có video AI` : 'không thấy thư mục media')}
+      ${tile('Lần sinh video / cảnh', avgV !== undefined ? avgV.toFixed(1) : '—', `${withV.length} cảnh đã sinh · ${chosen} có bản chốt${model.mediaFound ? '' : ' · không thấy thư mục media'}`)}
       ${tile('Ghi chú', `@C ${todo} · @T ${ask}`, 'xem ở sidebar')}
       ${tile('Tập phát hành kế tiếp', nextRelease ? nextRelease.id : '—', days !== undefined ? `còn ${days} ngày (${nextRelease!.releaseDate!.toLocaleDateString('vi-VN')})` : '')}
       ${tile('Chi phí AI tháng này', `${costMonth.usd.toFixed(2)} USD`, `${costMonth.runs} lần chạy · tổng ${costAll.usd.toFixed(2)} USD`)}
@@ -116,7 +123,8 @@ export class Dashboard {
       webview,
       'Tổng quan',
       `<div class="row" style="justify-content:space-between"><h1>${esc(p.name)}</h1>
-        <span class="muted">quét lúc ${model.scannedAt.toLocaleTimeString('vi-VN')} <button class="link" data-cmd="refresh">quét lại</button></span></div>
+        <span class="muted">quét lúc ${model.scannedAt.toLocaleTimeString('vi-VN')} <button class="link" data-cmd="refresh">quét lại</button>
+        <button class="link" data-cmd="settings">cài đặt AI</button><button class="link" data-cmd="endSession">kết thúc phiên</button></span></div>
       ${tiles}
       <h2>Các tập</h2>${epTable}
       ${sel ? this.episodeDetail(studio, sel) : ''}`,
@@ -130,6 +138,19 @@ export class Dashboard {
       const arg = esc(JSON.stringify([col.step, { ep: ep.id, seg: seg.code }]));
       let txt = '·';
       let cls = 'muted';
+      if (col.step === 'ket-qua') {
+        const done = seg.scenes.filter((c) => c.result);
+        if (done.length || seg.scenes.some((c) => c.media['V'])) {
+          cls = '';
+          const ok = done.filter((c) => c.result!.chosen).length;
+          const sum = seg.scenes.reduce((a, c) => a + (c.result?.attempts ?? c.media['V'] ?? 0), 0);
+          txt = `✅${ok} / ${seg.scenes.length} · ${sum} lần sinh`;
+        }
+        // bước cấp cảnh → ô mở cảnh đầu tiên chưa có bản chốt
+        const first = seg.scenes.find((c) => !c.result?.chosen && c.status !== 'dropped') ?? seg.scenes[0];
+        if (!first) return `<td class="muted">·</td>`;
+        return `<td class="${cls}"><a data-cmd="step" data-arg="${esc(JSON.stringify([col.step, { ep: ep.id, seg: seg.code, scene: first.code }]))}">${txt}</a></td>`;
+      }
       if (col.step === 'kich-ban') {
         const sec = scriptText ? findSection(scriptText, `[${seg.code}]`) : undefined;
         if (sec) {
@@ -156,7 +177,7 @@ export class Dashboard {
         s.dropped
           ? `<tr class="muted"><td><s>${s.code}</s></td><td colspan="${SEG_COLUMNS.length + 2}">${esc(s.name)} — bỏ</td></tr>`
           : `<tr><td><b>${s.code}</b></td><td>${s.relDir ? `<a data-open="${esc(s.dir!)}">${esc(s.name)}</a>` : esc(s.name)}</td>
-             <td>${s.plannedSeconds ?? ''}${s.scenes.length ? ` <span class="muted">/ ${s.scenes.reduce((a, c) => a + (c.seconds ?? 0), 0)}</span>` : ''}</td>
+             <td>${s.plannedSeconds ?? ''}${s.files['canh'] ? ` <a data-cmd="grid" data-arg="${esc(JSON.stringify({ ep: ep.id, seg: s.code }))}" title="sửa bảng cảnh dạng lưới">▦</a>` : ''}${s.scenes.length ? ` <span class="muted">/ ${s.scenes.reduce((a, c) => a + (c.seconds ?? 0), 0)}</span>` : ''}</td>
              ${SEG_COLUMNS.map((c) => cell(s, c)).join('')}</tr>`,
       )
       .join('');

@@ -3,7 +3,9 @@ import { Scope } from './core/config';
 import { StepTarget } from './core/context';
 import { registerCommands } from './ui/commands';
 import { Dashboard } from './ui/dashboard';
+import { GridPanel } from './ui/gridPanel';
 import { ModelRegistry } from './ui/models';
+import { SettingsPanel } from './ui/settingsPanel';
 import { StepPanel } from './ui/stepPanel';
 import { Studio } from './ui/studio';
 import { NotesTree, ProjectNode, ProjectTree, nodeTarget } from './ui/trees';
@@ -13,6 +15,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const models = new ModelRegistry(studio, context.secrets);
   const diagnostics = vscode.languages.createDiagnosticCollection('ai-film-studio');
   context.subscriptions.push(studio, diagnostics);
+
+  const openStep = (stepId: string, target: StepTarget) => StepPanel.open(studio, models, stepId, target);
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('aiFilmStudio.project', new ProjectTree(studio)),
@@ -43,10 +47,9 @@ export function activate(context: vscode.ExtensionContext): void {
     for (const [f, ds] of byFile) diagnostics.set(vscode.Uri.file(f), ds);
   });
 
-  const openStep = (stepId: string, target: StepTarget) => StepPanel.open(studio, models, stepId, target);
-
   const reg = (id: string, fn: (...a: any[]) => any) => context.subscriptions.push(vscode.commands.registerCommand(id, fn));
   reg('aiFilmStudio.openDashboard', () => Dashboard.show(studio, openStep));
+  reg('aiFilmStudio.openSettings', () => SettingsPanel.show(studio, models));
   reg('aiFilmStudio.openStep', openStep);
   reg('aiFilmStudio.pickStep', async (node?: ProjectNode) => {
     if (!studio.config) return vscode.window.showWarningMessage(studio.error ?? 'Chưa nạp dự án.');
@@ -56,7 +59,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const pick = await vscode.window.showQuickPick(
       steps.map((s) => ({
         label: `${s.no} ${s.title}`,
-        description: { human: 'người làm', chat: 'AI', agent: 'Claude Code' }[s.executor],
+        description: `${{ human: 'người làm', chat: 'AI', agent: 'Claude Code' }[s.executor]} · ${models.forStep(s.id)?.id ?? ''}`,
         detail: s.description,
         s,
       })),
@@ -64,8 +67,33 @@ export function activate(context: vscode.ExtensionContext): void {
     );
     if (pick) openStep(pick.s.id, target);
   });
-  reg('aiFilmStudio.setApiKey', () => models.setApiKey());
-  reg('aiFilmStudio.testModel', () => models.test());
+  reg('aiFilmStudio.editSceneTable', async (arg?: ProjectNode | { ep?: string; seg?: string }) => {
+    let ep: string | undefined;
+    let seg: string | undefined;
+    if (arg && 'kind' in arg && (arg.kind === 'segment' || arg.kind === 'scene')) {
+      ep = arg.ep.id;
+      seg = arg.seg.code;
+    } else if (arg && !('kind' in arg)) {
+      ep = arg.ep;
+      seg = arg.seg;
+    }
+    if (!ep || !seg) {
+      const segs = (studio.model?.episodes ?? []).flatMap((e) => e.segments.filter((s) => s.files['canh']).map((s) => ({ label: `${e.id} · ${s.code}`, description: s.name, e: e.id, s: s.code })));
+      const p = await vscode.window.showQuickPick(segs, { placeHolder: 'Sửa bảng cảnh của phân đoạn nào?' });
+      if (!p) return;
+      ep = p.e;
+      seg = p.s;
+    }
+    GridPanel.open(studio, ep, seg);
+  });
+  reg('aiFilmStudio.endSession', () => {
+    if (!studio.config?.pipeline.steps.some((s) => s.id === 'ket-thuc-phien')) {
+      return vscode.window.showWarningMessage('pipeline.yaml chưa có bước "ket-thuc-phien".');
+    }
+    openStep('ket-thuc-phien', {});
+  });
+  reg('aiFilmStudio.setApiKey', () => SettingsPanel.show(studio, models));
+  reg('aiFilmStudio.testModel', () => SettingsPanel.show(studio, models));
   registerCommands(context, studio);
 
   studio.load();
