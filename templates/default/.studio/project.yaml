@@ -1,0 +1,89 @@
+# AI Film Studio — cấu hình dự án (mẫu). Sửa cho khớp cấu trúc thư mục của dự án.
+# Mẫu này giả định cấu trúc:
+#   EPISODES/EP01_<ten>/README.md (bảng phân đoạn) · kich-ban-chi-tiet.md · tham-chieu/danh-ba-tham-chieu.md
+#   EPISODES/EP01_<ten>/phan-doan/A_<ten>/A_canh.md · A_loi.md · A_am-thanh.md · A_dung.md · A_prompt.md
+
+name: Phim mới
+version: 1
+episodeCapSeconds: 1200
+
+paths:
+  episodes: EPISODES
+  media: MEDIA                     # ảnh / video / audio — nên để ngoài git
+
+episode:
+  dirPattern: '^EP(\d{2})_(.+)$'
+  dirFormat: 'EP{nn}_{slug}'
+  exclude: [_TEMPLATE_TAP]
+  template: EPISODES/_TEMPLATE_TAP
+  files:
+    readme: README.md
+    script: kich-ban-chi-tiet.md
+    references: tham-chieu/danh-ba-tham-chieu.md
+  segmentTable:
+    file: readme
+    codeColumn: Mã
+    orderColumn: Thứ tự
+    nameColumn: Phân đoạn
+    secondsColumn: Giây
+    statusColumn: Trạng thái
+
+segment:
+  dir: phan-doan
+  dirPattern: '^([A-Z])_(.+)$'
+  template: EPISODES/_TEMPLATE_TAP/phan-doan/A_ten-phan-doan
+  files:
+    canh: '{X}_canh.md'
+    loi: '{X}_loi.md'
+    am-thanh: '{X}_am-thanh.md'
+    dung: '{X}_dung.md'
+    prompt: '{X}_prompt.md'
+
+sceneTable:
+  file: canh
+  codeColumn: Mã
+  secondsColumn: Giây
+  statusColumn: Trạng thái
+  nameColumn: Hình
+  minSeconds: 4
+  maxSeconds: 30
+
+codes:
+  segment: '[A-Z]'
+  scene: '^([A-Z])(\d{2})$'
+  line: '[A-Z]\d{2}_L\d+'
+  reference: '@\[([A-Z0-9_]+)\]'
+  media: '^EP(\d{2})_([A-Z]\d{2})_([IVRLAE])\d+'
+  ledger: .studio/ma-da-cap.json
+
+status:
+  todo: ['⬜']
+  writing: ['✍']
+  review: ['👀']
+  done: ['✅']
+  hold: ['⏸']
+  dropped: ['❌']
+
+notes:
+  todo: '@C:'
+  question: '@T:'
+  exclude: []
+
+# release: { firstDate: '2027-01-01', everyDays: 7, firstEpisode: 1 }
+forbiddenWords: []
+
+# Repo chỉ giữ văn bản — media nặng không vào git
+gitignore:
+  - MEDIA/
+  - '*.mp4'
+  - '*.mov'
+  - '*.wav'
+  - '*.mp3'
+  - '*.psd'
+  - '*.blend1'
+
+coreContext:
+  - path: README.md
+    maxChars: 6000
+
+scripts: []

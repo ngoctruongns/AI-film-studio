@@ -1,0 +1,7 @@
+# Gán model cho từng bước (tên model khai trong setting aiFilmStudio.models của từng máy).
+default: claude-code
+fallback: [claude-code]
+steps:
+  kich-ban: claude-code-opus
+  chia-canh: claude-code-opus
+  prompt: claude-code-opus

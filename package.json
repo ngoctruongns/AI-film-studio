@@ -1,0 +1,160 @@
+{
+  "name": "ai-film-studio",
+  "displayName": "AI Film Studio",
+  "description": "Quản lý pipeline làm phim AI: kịch bản → phân đoạn → cảnh → hồ sơ cảnh → prompt ảnh/video. Mỗi việc một tab, chọn model AI cho từng bước, dashboard tiến độ.",
+  "version": "0.1.0",
+  "publisher": "ngoctruongns",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ngoctruongns/AI-film-studio.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "workspaceContains:.studio/project.yaml",
+    "onWebviewPanel:aiFilmStudio.step",
+    "onWebviewPanel:aiFilmStudio.dashboard"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiFilmStudio",
+          "title": "AI Film Studio",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "aiFilmStudio": [
+        {
+          "id": "aiFilmStudio.project",
+          "name": "Dự án"
+        },
+        {
+          "id": "aiFilmStudio.notes",
+          "name": "Ghi chú @C / @T"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "aiFilmStudio.project",
+        "contents": "Chưa có dự án phim.\n[Chọn thư mục dự án](command:aiFilmStudio.setProjectRoot)\n[Khởi tạo .studio/ cho thư mục này](command:aiFilmStudio.initProject)"
+      }
+    ],
+    "commands": [
+      { "command": "aiFilmStudio.openDashboard", "title": "Mở tổng quan dự án", "category": "AI Film Studio", "icon": "$(dashboard)" },
+      { "command": "aiFilmStudio.refresh", "title": "Quét lại dự án", "category": "AI Film Studio", "icon": "$(refresh)" },
+      { "command": "aiFilmStudio.pickStep", "title": "Mở bước…", "category": "AI Film Studio", "icon": "$(play)" },
+      { "command": "aiFilmStudio.setProjectRoot", "title": "Chọn thư mục dự án", "category": "AI Film Studio" },
+      { "command": "aiFilmStudio.initProject", "title": "Khởi tạo .studio/ (cấu hình dự án)", "category": "AI Film Studio" },
+      { "command": "aiFilmStudio.updateGitignore", "title": "Cập nhật .gitignore (khối của tool)", "category": "AI Film Studio" },
+      { "command": "aiFilmStudio.startWork", "title": "Bắt đầu việc (git diff + git add -A)", "category": "AI Film Studio", "icon": "$(git-commit)" },
+      { "command": "aiFilmStudio.newEpisode", "title": "Thêm tập mới", "category": "AI Film Studio" },
+      { "command": "aiFilmStudio.newSegment", "title": "Thêm phân đoạn (cấp mã)", "category": "AI Film Studio" },
+      { "command": "aiFilmStudio.newSceneCode", "title": "Cấp mã cảnh mới", "category": "AI Film Studio" },
+      { "command": "aiFilmStudio.runScript", "title": "Chạy script của dự án…", "category": "AI Film Studio", "icon": "$(terminal)" },
+      { "command": "aiFilmStudio.setApiKey", "title": "Đặt khóa API cho model", "category": "AI Film Studio" },
+      { "command": "aiFilmStudio.testModel", "title": "Thử kết nối model", "category": "AI Film Studio" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "aiFilmStudio.openDashboard", "when": "view == aiFilmStudio.project", "group": "navigation@1" },
+        { "command": "aiFilmStudio.startWork", "when": "view == aiFilmStudio.project", "group": "navigation@2" },
+        { "command": "aiFilmStudio.refresh", "when": "view == aiFilmStudio.project", "group": "navigation@3" },
+        { "command": "aiFilmStudio.refresh", "when": "view == aiFilmStudio.notes", "group": "navigation" }
+      ],
+      "view/item/context": [
+        { "command": "aiFilmStudio.pickStep", "when": "view == aiFilmStudio.project && viewItem =~ /^(episode|segment|scene)$/", "group": "inline" },
+        { "command": "aiFilmStudio.newSegment", "when": "view == aiFilmStudio.project && viewItem == episode" },
+        { "command": "aiFilmStudio.newSceneCode", "when": "view == aiFilmStudio.project && viewItem == segment" }
+      ]
+    },
+    "configuration": {
+      "title": "AI Film Studio",
+      "properties": {
+        "aiFilmStudio.projectRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Đường dẫn tuyệt đối tới thư mục chính của dự án phim (chứa .studio/). Để trống = thư mục workspace đầu tiên có .studio/project.yaml."
+        },
+        "aiFilmStudio.machineProfile": {
+          "type": "string",
+          "default": "",
+          "description": "Tên hồ sơ máy (vd. laptop, cong-ty, may-nha) — chỉ để ghi vào nhật ký chạy AI."
+        },
+        "aiFilmStudio.mediaRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Thư mục media (ảnh, video, audio) trên MÁY NÀY. Để trống = paths.media trong .studio/project.yaml."
+        },
+        "aiFilmStudio.claudePath": {
+          "type": "string",
+          "default": "",
+          "description": "Đường dẫn tới CLI 'claude'. Để trống = tìm 'claude' trên PATH, rồi bản đi kèm extension Claude Code."
+        },
+        "aiFilmStudio.maxInputTokens": {
+          "type": "number",
+          "default": 60000,
+          "description": "Trần token ngữ cảnh một lần chạy. Vượt thì hỏi lại trước khi gửi."
+        },
+        "aiFilmStudio.models": {
+          "type": "array",
+          "description": "Danh sách model trên MÁY NÀY (kiểu Continue). Khóa API không ghi ở đây — dùng lệnh 'Đặt khóa API'.",
+          "default": [
+            { "id": "claude-code", "provider": "claude-code", "title": "Claude Code (model mặc định)" },
+            { "id": "claude-code-opus", "provider": "claude-code", "model": "opus", "title": "Claude Code · Opus" },
+            { "id": "claude-code-sonnet", "provider": "claude-code", "model": "sonnet", "title": "Claude Code · Sonnet" },
+            { "id": "claude-code-haiku", "provider": "claude-code", "model": "haiku", "title": "Claude Code · Haiku" }
+          ],
+          "items": {
+            "type": "object",
+            "required": ["id", "provider"],
+            "properties": {
+              "id": { "type": "string", "description": "Tên dùng trong .studio/models.yaml" },
+              "title": { "type": "string" },
+              "provider": { "type": "string", "enum": ["claude-code", "anthropic", "openai", "openai-compatible", "gemini"] },
+              "model": { "type": "string", "description": "Tên model của nhà cung cấp" },
+              "apiBase": { "type": "string", "description": "openai-compatible: vd. http://localhost:11434/v1 (Ollama)" },
+              "secret": { "type": "string", "description": "Tên khóa trong SecretStorage (mặc định = provider)" },
+              "maxOutputTokens": { "type": "number" },
+              "contextWindow": { "type": "number" },
+              "price": {
+                "type": "object",
+                "description": "USD / 1 triệu token",
+                "properties": { "input": { "type": "number" }, "output": { "type": "number" } }
+              },
+              "extraArgs": { "type": "array", "items": { "type": "string" }, "description": "claude-code: tham số CLI thêm" }
+            }
+          }
+        },
+        "aiFilmStudio.stepModels": {
+          "type": "object",
+          "default": {},
+          "description": "Gán model theo bước RIÊNG MÁY NÀY (ghi đè .studio/models.yaml). Ví dụ { \"am-thanh\": \"local-qwen\" }."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run compile && node out/test/smoke.js",
+    "package": "npx @vscode/vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  }
+}

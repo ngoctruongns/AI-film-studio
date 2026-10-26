@@ -1,0 +1,180 @@
+// Cấu hình dự án phim — đọc từ <projectRoot>/.studio/*.yaml.
+// Mọi thứ riêng của một dự án (tên thư mục, mẫu tên file, cột bảng, ký hiệu) nằm ở đây,
+// để tool dùng được cho dự án phim khác mà không sửa mã.
+import * as fs from 'fs';
+import * as path from 'path';
+import YAML from 'yaml';
+
+export const STUDIO_DIR = '.studio';
+
+export type StatusKey = 'todo' | 'writing' | 'review' | 'done' | 'hold' | 'dropped';
+export const STATUS_ORDER: StatusKey[] = ['todo', 'writing', 'review', 'done', 'hold', 'dropped'];
+
+export interface TableSpec {
+  /** Khóa file (trong segment.files / episode.files) hoặc đường dẫn tương đối */
+  file: string;
+  codeColumn: string;
+  secondsColumn?: string;
+  statusColumn?: string;
+  nameColumn?: string;
+  orderColumn?: string;
+}
+
+export interface ScriptSpec {
+  id: string;
+  label: string;
+  /** Lệnh shell; placeholder: {root} {episodeDir} {segmentDir} {ep} {X} {scene} */
+  command: string;
+  /** Hiện nút ở tab của các bước này */
+  steps?: string[];
+}
+
+export interface ProjectConfig {
+  name: string;
+  version: number;
+  episodeCapSeconds?: number;
+  paths: {
+    episodes: string;
+    media?: string;
+  };
+  episode: {
+    dirPattern: string;
+    exclude?: string[];
+    template?: string;
+    /** Định dạng tên thư mục khi tạo tập mới: {nn} {slug} */
+    dirFormat?: string;
+    /** Khóa → đường dẫn tương đối trong thư mục tập */
+    files: Record<string, string>;
+    segmentTable?: TableSpec;
+  };
+  segment: {
+    dir: string;
+    dirPattern: string;
+    /** Khóa → mẫu tên file, {X} = mã phân đoạn */
+    files: Record<string, string>;
+    /** Thư mục mẫu của một phân đoạn (trong template tập), mã mẫu là 'A' */
+    template?: string;
+  };
+  sceneTable: TableSpec & { minSeconds?: number; maxSeconds?: number };
+  codes: {
+    segment: string;
+    scene: string;
+    line: string;
+    reference?: string;
+    media?: string;
+    ledger?: string;
+  };
+  status: Record<StatusKey, string[]>;
+  notes: {
+    todo: string;
+    question: string;
+    include?: string[];
+    exclude?: string[];
+  };
+  release?: {
+    firstDate: string;
+    everyDays: number;
+    firstEpisode: number;
+  };
+  forbiddenWords?: string[];
+  gitignore?: string[];
+  scripts?: ScriptSpec[];
+  /** File nạp làm "lõi dự án" cho model không tự đọc repo */
+  coreContext?: { path: string; select?: string; maxChars?: number }[];
+}
+
+export type Scope = 'project' | 'episode' | 'segment' | 'scene';
+
+export interface FileRef {
+  /** Đường dẫn tương đối gốc dự án, có placeholder {episodeDir} {segmentDir} {ep} {T} {X} {scene} */
+  path: string;
+  /** 'heading:<chữ>' — mục có tiêu đề chứa chữ · 'row:<mã>' — các dòng bảng chứa mã */
+  select?: string;
+  label?: string;
+  maxChars?: number;
+  optional?: boolean;
+}
+
+export interface StepGate {
+  /** Ô bảng phải đạt trạng thái: file + mã dòng + cột */
+  table?: { file: string; row: string; column: string };
+  /** Các file phải có */
+  exists?: string[];
+  require?: StatusKey;
+}
+
+export interface StepSpec {
+  id: string;
+  no: string;
+  title: string;
+  scope: Scope;
+  /** human = Trường làm, tool chỉ mở file · chat = model văn bản · agent = Claude Code có công cụ */
+  executor: 'human' | 'chat' | 'agent';
+  description?: string;
+  inputs?: FileRef[];
+  output?: FileRef & { mode?: 'replace' | 'section' };
+  gate?: StepGate;
+  /** Đường dẫn mẫu prompt, tương đối thư mục .studio/ */
+  prompt?: string;
+  scripts?: string[];
+}
+
+export interface PipelineConfig {
+  steps: StepSpec[];
+}
+
+export interface ModelsConfig {
+  default: string;
+  fallback?: string[];
+  steps?: Record<string, string>;
+}
+
+export interface StudioConfig {
+  root: string;
+  project: ProjectConfig;
+  pipeline: PipelineConfig;
+  models: ModelsConfig;
+}
+
+function readYaml<T>(file: string): T {
+  return YAML.parse(fs.readFileSync(file, 'utf8')) as T;
+}
+
+export function hasStudio(root: string): boolean {
+  return fs.existsSync(path.join(root, STUDIO_DIR, 'project.yaml'));
+}
+
+export function loadStudioConfig(root: string): StudioConfig {
+  const dir = path.join(root, STUDIO_DIR);
+  const project = readYaml<ProjectConfig>(path.join(dir, 'project.yaml'));
+  const pipelineFile = path.join(dir, 'pipeline.yaml');
+  const modelsFile = path.join(dir, 'models.yaml');
+  const pipeline = fs.existsSync(pipelineFile) ? readYaml<PipelineConfig>(pipelineFile) : { steps: [] };
+  const models = fs.existsSync(modelsFile) ? readYaml<ModelsConfig>(modelsFile) : { default: 'claude-code' };
+  return { root, project, pipeline, models };
+}
+
+/** Ký hiệu → trạng thái. Lấy ký hiệu xuất hiện SỚM NHẤT trong chuỗi. */
+export function parseStatus(text: string, status: ProjectConfig['status']): StatusKey | undefined {
+  let best: { key: StatusKey; pos: number } | undefined;
+  for (const key of STATUS_ORDER) {
+    for (const sym of status[key] ?? []) {
+      const pos = text.indexOf(sym);
+      if (pos >= 0 && (!best || pos < best.pos)) best = { key, pos };
+    }
+  }
+  return best?.key;
+}
+
+export function statusSymbol(key: StatusKey | undefined, status: ProjectConfig['status']): string {
+  return key ? status[key]?.[0] ?? '' : '';
+}
+
+export const STATUS_LABEL: Record<StatusKey, string> = {
+  todo: 'chưa làm',
+  writing: 'đang viết',
+  review: 'chờ duyệt',
+  done: 'duyệt',
+  hold: 'treo',
+  dropped: 'bỏ',
+};

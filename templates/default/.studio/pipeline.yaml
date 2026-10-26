@@ -1,0 +1,54 @@
+# Các bước pipeline — xem chú thích đầy đủ trong docs/KIEN-TRUC.md của AI Film Studio.
+steps:
+  - id: kich-ban
+    no: ③
+    title: Kịch bản chi tiết — một phân đoạn
+    scope: segment
+    executor: chat
+    inputs:
+      - { path: '{episodeDir}/README.md', select: 'row:{X}' }
+    output: { path: '{episodeDir}/kich-ban-chi-tiet.md', select: 'heading:[{X}]', mode: section }
+    prompt: prompts/kich-ban.md
+
+  - id: chia-canh
+    no: ④
+    title: Chia cảnh
+    scope: segment
+    executor: chat
+    gate:
+      table: { file: '{episodeDir}/README.md', row: '{X}', column: Trạng thái }
+      require: done
+    inputs:
+      - { path: '{episodeDir}/kich-ban-chi-tiet.md', select: 'heading:[{X}]' }
+    output: { path: '{segmentDir}/{X}_canh.md' }
+    prompt: prompts/chia-canh.md
+
+  - id: loi
+    no: ⑤a
+    title: Lời dẫn + thoại
+    scope: segment
+    executor: chat
+    gate: { exists: ['{segmentDir}/{X}_canh.md'] }
+    inputs:
+      - { path: '{segmentDir}/{X}_canh.md' }
+    output: { path: '{segmentDir}/{X}_loi.md' }
+    prompt: prompts/loi.md
+
+  - id: prompt
+    no: ⑤d
+    title: Prompt ảnh + video của cảnh
+    scope: scene
+    executor: chat
+    inputs:
+      - { path: '{segmentDir}/{X}_canh.md', select: 'row:{scene}' }
+      - { path: '{episodeDir}/tham-chieu/danh-ba-tham-chieu.md', optional: true }
+    output: { path: '{segmentDir}/{X}_prompt.md', select: 'heading:{scene}', mode: section }
+    prompt: prompts/prompt.md
+
+  - id: ket-qua
+    no: ⑦
+    title: Tạo hình — ghi kết quả
+    scope: scene
+    executor: human
+    inputs:
+      - { path: '{segmentDir}/{X}_canh.md', select: 'row:{scene}' }
