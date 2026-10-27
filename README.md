@@ -114,7 +114,7 @@ cd <repo phim>/04_PRODUCTION/tools/studio
 git pull
 code --install-extension ai-film-studio-<phiên bản>.vsix --force
 ```
-Sửa mã rồi tự build: `npm install` → `npm run package` (xóa `.vsix` cũ, tạo bản mới) → cài như trên.
+Sửa mã rồi tự build: **`npm install`** (lần đầu, hoặc khi package.json đổi — thiếu bước này sẽ lỗi `missing: yaml`) → `npm run package` (đóng gói xong mới xóa `.vsix` cũ) → cài như trên.
 → **Developer: Reload Window**. Cài đặt, model, khóa API giữ nguyên.
 
 ### Gỡ

@@ -369,7 +369,7 @@
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
     "test": "npm run compile && node out/test/smoke.js && node out/test/gui.js",
-    "package": "node -e \"for (const f of require('fs').readdirSync('.')) if (f.endsWith('.vsix')) require('fs').unlinkSync(f)\" && npx --yes @vscode/vsce@3 package --allow-missing-repository --skip-license"
+    "package": "npx --yes @vscode/vsce@3 package --allow-missing-repository --skip-license && node -e \"const fs = require('fs'), keep = 'ai-film-studio-' + require('./package.json').version + '.vsix'; for (const f of fs.readdirSync('.')) if (f.endsWith('.vsix') && f !== keep) fs.unlinkSync(f)\""
   },
   "dependencies": {
     "yaml": "^2.5.0"
