@@ -9,8 +9,16 @@ import { formatDuration } from '../core/markdown';
 import { ResolvedStep, StepTarget, buildPrompt, extractOutput, mergeOutput, resolveStep, targetKey } from '../core/context';
 import { ModelConfig, estimateCost } from '../core/providers';
 import { MediaFile, listSceneMedia, mediaTargetName, upsertResult } from '../core/results';
+import { Mark, appendAttempt, parseMark } from '../core/attempts';
 import { RunRecord, newRunId, readRuns, runPath, writeRun } from '../core/runs';
-import { fill, findEpisode, findScene, findSegment } from '../core/scanner';
+import { episodeLabel, fill, findEpisode, findScene, findSegment } from '../core/scanner';
+import { readIdea, writeIdea } from '../core/idea';
+import { isResource } from '../core/resources';
+import { scenePrompts } from '../core/scenePrompts';
+import { mergeSegmentTable, setSegmentStatus } from '../core/segmentTable';
+import { slugify } from '../core/episodeList';
+import { createSegmentDir } from './commands';
+import { GRID_BODY, GridController, gridClientJs } from './gridPanel';
 import { scanBlender } from '../core/blender';
 import { gotoShotInBlender } from './blenderPanel';
 import { ModelRegistry } from './models';
@@ -47,24 +55,31 @@ export class StepPanel {
   private runs: RunRecord[] = [];
   private aborts = new Map<string, AbortController>();
   private shown?: number;
+  /** lưới bảng cảnh nằm trong tab (bước ⑥ Phân cảnh) */
+  private gridCtl?: GridController;
+  private gridKind?: 'scenes' | 'lines';
   private readonly subs: vscode.Disposable[] = [];
 
   /** Mở tab của đối tượng; có stepId thì chọn luôn bước đó */
-  static open(studio: Studio, models: ModelRegistry, stepId: string | undefined, target: StepTarget): void {
+  static open(studio: Studio, models: ModelRegistry, stepId: string | undefined, target: StepTarget, autoRun = false): void {
     const key = targetKey(target);
     const existing = this.panels.get(key);
     if (existing) {
       if (stepId && stepId !== existing.state.stepId) existing.select(stepId);
       existing.panel.reveal();
+      if (autoRun) existing.startRuns(false, false);
       return;
     }
     const icon = { project: '📁', episode: '🎬', segment: '▤', scene: '◆' }[scopeOf(target)];
-    const panel = vscode.window.createWebviewPanel(this.viewType, `${icon} ${key}`, vscode.ViewColumn.Active, {
+    const ep = target.ep && studio.model ? findEpisode(studio.model, target.ep) : undefined;
+    const label = ep ? key.replace(ep.id, ep.release ?? ep.id) : key;
+    const panel = vscode.window.createWebviewPanel(this.viewType, `${icon} ${label}`, vscode.ViewColumn.Active, {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: StepPanel.roots(studio),
     });
-    new StepPanel(panel, studio, models, { stepId, target });
+    const sp = new StepPanel(panel, studio, models, { stepId, target });
+    if (autoRun) sp.startRuns(false, false);
   }
 
   static revive(panel: vscode.WebviewPanel, studio: Studio, models: ModelRegistry, state: PanelState | undefined): void {
@@ -166,7 +181,7 @@ export class StepPanel {
     const scope = scopeOf(this.state.target);
     const { ep, seg, scene } = this.nodes();
     const crumbs: { label: string; target?: StepTarget }[] = [{ label: model.config.project.name, target: {} }];
-    if (ep) crumbs.push({ label: ep.id, target: { ep: ep.id } });
+    if (ep) crumbs.push({ label: ep.release ?? ep.id, target: { ep: ep.id } });
     if (seg) crumbs.push({ label: seg.code, target: { ep: ep!.id, seg: seg.code } });
     if (scene) crumbs.push({ label: scene.code });
     const facts: { k: string; v: string }[] = [];
@@ -181,9 +196,10 @@ export class StepPanel {
       facts.push({ k: 'Cảnh', v: count(live.flatMap((e) => e.segments.flatMap((s) => s.scenes))) });
       const next = model.episodes.find((e) => e.releaseDate && e.releaseDate >= new Date());
       if (next) facts.push({ k: 'Phát hành kế tiếp', v: `${next.id} · ${next.releaseDate!.toLocaleDateString('vi-VN')}` });
-      links.push({ cmd: 'dashboard', label: '📊 Tổng quan' }, { cmd: 'settings', label: '⚙ Cài đặt AI' });
+      links.push({ cmd: 'dashboard', label: '📊 Trạng thái dự án' }, { cmd: 'episodes', label: '▦ Danh sách tập' }, { cmd: 'settings', label: '⚙ Cài đặt AI' });
     } else if (scope === 'episode' && ep) {
-      title = `${ep.id} · ${ep.slug.replace(/-/g, ' ')}`;
+      title = episodeLabel(ep, ' · ');
+      facts.push({ k: 'Mã sản xuất', v: ep.id });
       const segs = ep.segments.filter((x) => !x.dropped);
       const scenes = segs.flatMap((x) => x.scenes).filter((c) => c.status !== 'dropped');
       facts.push({ k: 'Phân đoạn', v: count(segs) }, { k: 'Cảnh', v: count(scenes) });
@@ -235,7 +251,11 @@ export class StepPanel {
     const rs = this.resolve();
     if (!rs) return { overview, steps, current: this.stepId, target: this.state.target, error: steps.length ? `Không thấy bước "${this.stepId}"` : 'Cấp này chưa có bước nào trong .studio/pipeline.yaml' };
     const m = this.model();
-    const files = [...rs.inputs, ...(rs.output ? [rs.output] : [])].map((f, i) => ({
+    // tài liệu dùng chung (Tài nguyên dự án) không liệt kê ở tab tập / phân đoạn / cảnh — AI vẫn đọc
+    const res = this.studio.config!.project.resources;
+    const all = [...rs.inputs, ...(rs.output ? [rs.output] : [])];
+    const shared = rs.step.scope === 'project' ? [] : all.filter((f) => f.role !== 'output' && !f.virtual && f.rel && isResource(f.rel, res));
+    const files = all.map((f, i) => ({
       i,
       label: f.label,
       abs: f.abs,
@@ -247,6 +267,7 @@ export class StepPanel {
       optional: !!f.ref.optional,
       virtual: !!f.virtual,
       chars: f.text?.length ?? 0,
+      shared: shared.includes(f),
     }));
     const fileSet = new Set(files.map((f) => f.abs).filter(Boolean));
     const notes = this.studio.notes.filter((n) => fileSet.has(n.file)).map((n) => ({ ...n, rel: this.studio.rel(n.file) }));
@@ -265,8 +286,9 @@ export class StepPanel {
       .slice(0, 6);
     const view = rs.step.view ?? [];
     let media: object | undefined;
-    if (view.includes('media') || (rs.step.scope === 'scene' && rs.target.scene)) {
-      const files = this.sceneMedia(rs).map((f) => ({
+    if (view.includes('media') || view.includes('render')) {
+      // ⑩ Blender: chỉ ảnh / clip render tham chiếu (_R) — ảnh, video AI không đưa vào tool (28/10/2026)
+      const files = this.sceneMedia(rs).filter((f) => !view.includes('render') || f.kind === 'R').map((f) => ({
         name: f.name,
         abs: f.abs,
         kind: f.kind,
@@ -278,11 +300,15 @@ export class StepPanel {
       }));
       media = {
         full: view.includes('media'),
+        renderOnly: view.includes('render'),
         files,
         root: this.studio.model?.mediaRoot,
         rootFound: this.studio.model?.mediaFound,
         result: scene?.result,
         videos: files.filter((f) => f.kind === 'V').map((f) => f.name),
+        criteria: this.studio.config?.project.attemptLog?.criteria ?? [],
+        seconds: scene?.seconds,
+        logged: seg?.attempts.filter((a) => a.scene === rs.target.scene).length ?? 0,
       };
     }
     let blender: object | undefined;
@@ -298,6 +324,7 @@ export class StepPanel {
     return {
       overview,
       steps,
+      editor: this.editorVm(view),
       current: this.stepId,
       request: this.request,
       title: rs.title,
@@ -312,7 +339,8 @@ export class StepPanel {
       compare: this.compareIds.get(this.stepId),
       estimate,
       scripts,
-      grid: view.includes('grid') && !!seg?.files['canh'],
+      grid: (view.includes('grid') && !!seg?.files['canh']) || (view.includes('lines') && !!seg?.files['loi']),
+      gridKind: view.includes('lines') ? 'lines' : 'scenes',
       scene: scene && {
         code: scene.code,
         seconds: scene.seconds,
@@ -333,6 +361,16 @@ export class StepPanel {
 
   // ------------------------------------------------------------------ messages
   private async onMessage(m: any): Promise<void> {
+    if (m.__grid) {
+      const t = this.state.target;
+      if (!t.seg) return;
+      const kind = this.resolve()?.step.view?.includes('lines') ? 'lines' : 'scenes';
+      if (!this.gridCtl || this.gridKind !== kind) {
+        this.gridCtl = new GridController(this.studio, (x) => this.panel.webview.postMessage(x), t.ep, t.seg, kind);
+        this.gridKind = kind;
+      }
+      return this.gridCtl.onMessage(m);
+    }
     switch (m.type) {
       case 'ready':
         return this.post();
@@ -354,6 +392,23 @@ export class StepPanel {
         return this.approve(m.undo === true);
       case 'saveResult':
         return this.saveResult(m.result);
+      case 'logAttempt':
+        return this.logAttempt(m.a);
+      case 'saveIdea':
+        return this.saveIdea(m.values ?? {});  // khóa = số thứ tự ô trong form
+      case 'saveSynopsis':
+        return this.saveSynopsis(String(m.text ?? ''));
+      case 'saveOutline':
+        return this.saveOutline(String(m.text ?? ''), m.next === true);
+      case 'copy':
+        await vscode.env.clipboard.writeText(String(m.text ?? ''));
+        return void vscode.window.showInformationMessage(`Đã chép ${m.label ? m.label + ' — ' : ''}${String(m.text ?? '').length} ký tự.`);
+      case 'saveSection':
+        return this.saveSection(String(m.text ?? ''), m.next === true);
+      case 'segStatus':
+        return this.saveSegStatus(m.changes ?? {});
+      case 'phanCanh':
+        return this.phanCanh();
       case 'cmd':
         switch (m.cmd) {
           case 'show':
@@ -383,6 +438,8 @@ export class StepPanel {
             return this.createOutput();
           case 'grid':
             return vscode.commands.executeCommand('aiFilmStudio.editSceneTable', { ep: this.state.target.ep, seg: this.state.target.seg });
+          case 'episodes':
+            return vscode.commands.executeCommand('aiFilmStudio.editEpisodeList');
           case 'import':
             return this.importMedia();
           case 'openMedia':
@@ -436,7 +493,7 @@ export class StepPanel {
     await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
   }
 
-  private async startRuns(skipGate: boolean, compare: boolean): Promise<void> {
+  async startRuns(skipGate: boolean, compare: boolean): Promise<void> {
     const rs = this.resolve();
     const main = this.model();
     if (!rs || !main) return;
@@ -567,6 +624,21 @@ export class StepPanel {
     rec.status = 'applied';
     writeRun(this.studio.root!, rec);
     vscode.window.showInformationMessage(`Đã ghi ${rs.output.rel} (bản của ${rec.modelId}). Xem bằng git diff — tool không git add.`);
+    if (rs.step.view?.includes('grid') || rs.step.view?.includes('lines')) this.gridCtl?.load();
+    // ④ kịch bản chi tiết: bảng phân đoạn AI viết → nhận dòng mới vào README tập (mục con trên cây)
+    if (rs.step.view?.includes('segments')) {
+      const { ep } = this.nodes();
+      const t = this.studio.model?.config.project.episode.segmentTable;
+      if (ep && t) {
+        const readme = ep.files['readme'] ?? path.join(ep.dir, this.studio.model!.config.project.episode.files['readme'] ?? 'README.md');
+        const old = fs.existsSync(readme) ? fs.readFileSync(readme, 'utf8') : `# ${ep.id} — mục lục phân đoạn\n`;
+        const r = mergeSegmentTable(old, fs.readFileSync(rs.output.abs, 'utf8'), { code: t.codeColumn, name: t.nameColumn ?? 'Phân đoạn' });
+        if (r.added.length) {
+          fs.writeFileSync(readme, r.text, 'utf8');
+          vscode.window.showInformationMessage(`Bảng phân đoạn: thêm ${r.added.join(', ')} (⬜ chưa duyệt) vào ${this.studio.rel(readme)}.`);
+        }
+      }
+    }
     this.studio.refresh();
   }
 
@@ -612,6 +684,174 @@ export class StepPanel {
     const term = vscode.window.createTerminal({ name: `Script · ${s.label}`, cwd: this.studio.root });
     term.show();
     term.sendText(fill(s.command, rs.ph));
+  }
+
+  // ------------------------------------------------------------------ form ① ý tưởng + phong cách · ② kịch bản tóm tắt + danh sách tập
+  private editorVm(view: string[]) {
+    const p = this.studio.model!.config.project;
+    const read = (rel: string) => (this.studio.exists(rel) ? fs.readFileSync(this.studio.abs(rel), 'utf8') : '');
+    if (view.includes('idea') && p.idea) {
+      return { kind: 'idea', file: p.idea.file, fields: p.idea.fields, values: readIdea(read(p.idea.file), p.idea) };
+    }
+    if (view.includes('outline')) {
+      const rs = this.resolve();
+      const f = rs?.inputs[0];
+      return { kind: 'outline', file: f?.rel, text: f?.abs && fs.existsSync(f.abs) ? fs.readFileSync(f.abs, 'utf8') : '', next: rs?.step.next };
+    }
+    if (view.includes('prompts')) {
+      const { ep, seg, scene } = this.nodes();
+      if (!ep || !seg || !scene) return undefined;
+      const b = scenePrompts(this.studio.root!, ep, seg.code, scene.code, p.scenePrompts);
+      return { kind: 'prompts', scene: scene.code, file: seg.files['prompt'] ? this.studio.rel(seg.files['prompt']) : undefined, own: b.scene, refs: b.refs };
+    }
+    if (view.includes('render')) {
+      const rs = this.resolve();
+      const f = rs?.inputs.find((x) => x.ref.select?.startsWith('row:') && /render/.test(x.rel));
+      return { kind: 'render', file: f?.rel, line: f?.line ?? 0, rows: f?.exists && f.found ? f.text ?? '' : '' };
+    }
+    if (view.includes('section')) {
+      const rs = this.resolve();
+      const o = rs?.output;
+      const { seg } = this.nodes();
+      const text = o?.exists && o.found ? o.text ?? '' : `## [${seg?.code ?? ''}] ${seg?.name ?? ''}\n\n`;
+      return { kind: 'section', file: o?.rel, line: o?.line ?? 0, found: !!o?.found, text, next: rs?.step.next };
+    }
+    if (view.includes('segments')) {
+      const { ep } = this.nodes();
+      const st = p.status;
+      const scriptText = ep?.files['script'] ? fs.readFileSync(ep.files['script'], 'utf8') : '';
+      const lineOf = (code: string) => Math.max(0, scriptText.split(/\r?\n/).findIndex((l) => /^#{1,3}\s/.test(l) && l.includes(`[${code}]`)));
+      return {
+        kind: 'segments',
+        ep: ep?.id,
+        readme: ep?.files['readme'] ? this.studio.rel(ep.files['readme']) : undefined,
+        script: ep?.files['script'],
+        choices: p.sceneTable.statusChoices ?? [{ value: '✅', label: 'Đã duyệt' }, { value: '⬜', label: 'Chưa duyệt' }],
+        segments: (ep?.segments ?? []).map((x) => ({
+          code: x.code,
+          name: x.name,
+          seconds: x.plannedSeconds,
+          status: x.status === 'done' ? '✅' : '⬜',
+          note: x.statusText,
+          dropped: x.dropped,
+          scenes: x.scenes.length,
+          hasDir: !!x.dir,
+          sym: statusSymbol(x.status, st),
+          line: lineOf(x.code),
+        })),
+      };
+    }
+    if (view.includes('synopsis')) {
+      const dirs = new Map(this.studio.model!.episodes.map((e) => [e.id, e]));
+      const rel = p.release;
+      const date = (tap?: string) => {
+        if (!rel || !tap) return '';
+        const d = new Date(rel.firstDate);
+        d.setDate(d.getDate() + (Number(tap.replace(/\D/g, '')) - rel.firstEpisode) * rel.everyDays);
+        return d.toLocaleDateString('vi-VN');
+      };
+      return {
+        kind: 'synopsis',
+        file: p.synopsis,
+        text: p.synopsis ? read(p.synopsis) : '',
+        listFile: p.episodeList?.file,
+        episodes: this.studio.model!.episodeList.map((r) => ({
+          code: r.code,
+          release: r.unreleased ? '' : r.release ?? '',
+          name: r.name,
+          status: r.statusText,
+          dropped: r.dropped,
+          date: r.unreleased ? '' : date(r.release),
+          dir: dirs.get(r.code)?.relDir ?? '',
+        })),
+        runLabel: this.resolve()?.step.runLabel,
+      };
+    }
+    return undefined;
+  }
+
+  private saveIdea(byIndex: Record<string, string>): void {
+    const cfg = this.studio.model?.config.project.idea;
+    if (!cfg) return;
+    const values: Record<string, string> = {};
+    cfg.fields.forEach((f, i) => {
+      if (byIndex[i] !== undefined) values[f.label] = String(byIndex[i]);
+    });
+    const abs = this.studio.abs(cfg.file);
+    const old = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : undefined;
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, writeIdea(old, values, cfg), 'utf8');
+    vscode.window.showInformationMessage(`Đã lưu ${cfg.file}. Xem bằng git diff.`);
+    this.studio.refresh();
+  }
+
+  private saveOutline(text: string, next: boolean): void {
+    const rs = this.resolve();
+    const f = rs?.inputs[0];
+    if (!rs || !f?.abs) return;
+    fs.mkdirSync(path.dirname(f.abs), { recursive: true });
+    fs.writeFileSync(f.abs, text.replace(/\s*$/, '\n'), 'utf8');
+    this.studio.refresh();
+    if (!next || !rs.step.next) return void vscode.window.showInformationMessage(`Đã lưu ${f.rel}.`);
+    // ③ → ④: chuyển bước và cho AI chạy luôn
+    this.select(rs.step.next.step);
+    this.startRuns(false, false);
+  }
+
+  /** ⑤ Kịch bản phân đoạn: ghi lại đúng mục [X] trong kịch bản chi tiết của tập; next → sang ⑥ và AI tạo phân cảnh */
+  private saveSection(text: string, next: boolean): void {
+    const rs = this.resolve();
+    if (!rs?.output) return;
+    fs.mkdirSync(path.dirname(rs.output.abs), { recursive: true });
+    fs.writeFileSync(rs.output.abs, mergeOutput(rs, text.replace(/\s*$/, '\n')), 'utf8');
+    this.studio.refresh();
+    if (!next || !rs.step.next) return void vscode.window.showInformationMessage(`Đã lưu mục ${rs.output.ref.select?.replace('heading:', '') ?? ''} trong ${rs.output.rel}.`);
+    this.select(rs.step.next.step);
+    this.startRuns(false, false);
+  }
+
+  /** đổi trạng thái phân đoạn trong bảng README tập — changes: mã → ký hiệu */
+  private saveSegStatus(changes: Record<string, string>): void {
+    const { ep } = this.nodes();
+    const readme = ep?.files['readme'];
+    const t = this.studio.model?.config.project.episode.segmentTable;
+    if (!readme || !t) return;
+    let text = fs.readFileSync(readme, 'utf8');
+    const done: string[] = [];
+    for (const [code, sym] of Object.entries(changes)) {
+      const nt = setSegmentStatus(text, { code: t.codeColumn, status: t.statusColumn ?? 'Trạng thái' }, code, sym);
+      if (nt !== undefined) (text = nt), done.push(`${code} ${sym}`);
+    }
+    fs.writeFileSync(readme, text, 'utf8');
+    vscode.window.showInformationMessage(`Đã đổi trạng thái: ${done.join(' · ') || '(không dòng nào)'} — ${this.studio.rel(readme)}.`);
+    this.studio.refresh();
+  }
+
+  /** "Phân cảnh": phân đoạn đã duyệt mà chưa có cảnh → tạo mục con (thư mục từ mẫu) + mở tab ⑤ và cho AI chia cảnh luôn */
+  private async phanCanh(): Promise<void> {
+    const { ep } = this.nodes();
+    if (!ep || !this.studio.model) return;
+    const todo = ep.segments.filter((x) => !x.dropped && x.status === 'done' && !x.scenes.length);
+    if (!todo.length) return void vscode.window.showInformationMessage('Không có phân đoạn nào đã duyệt mà chưa chia cảnh.');
+    const ok = await vscode.window.showInformationMessage(
+      `Tạo mục con + AI chia cảnh cho ${todo.length} phân đoạn: ${todo.map((x) => x.code).join(', ')}? Mỗi phân đoạn mở một tab, xem diff rồi Nhận.`,
+      { modal: true },
+      'Phân cảnh',
+    );
+    if (ok !== 'Phân cảnh') return;
+    for (const x of todo) if (!x.dir) createSegmentDir(this.studio, ep, x.code, slugify(x.name).toLowerCase() || x.code.toLowerCase());
+    this.studio.refresh();
+    for (const x of todo) StepPanel.open(this.studio, this.models, 'chia-canh', { ep: ep.id, seg: x.code }, true);
+  }
+
+  private saveSynopsis(text: string): void {
+    const rel = this.studio.model?.config.project.synopsis;
+    if (!rel) return;
+    const abs = this.studio.abs(rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text.replace(/\s*$/, '\n'), 'utf8');
+    vscode.window.showInformationMessage(`Đã lưu ${rel}. Xem bằng git diff.`);
+    this.studio.refresh();
   }
 
   private async createOutput(): Promise<void> {
@@ -692,6 +932,36 @@ export class StepPanel {
     this.studio.refresh();
   }
 
+  /** Sổ thử nghiệm: thêm một dòng "Nhật ký lần sinh" vào <X>_ket-qua.md */
+  private logAttempt(a: { variant?: string; model?: string; credit?: string; seconds?: string; marks?: string[]; usable?: string; note?: string }): void {
+    const rs = this.resolve();
+    const ep = rs && findEpisode(this.studio.model!, rs.target.ep);
+    const seg = findSegment(ep, rs?.target.seg);
+    if (!rs?.target.scene || !seg?.dir) return;
+    const pattern = this.studio.config!.project.segment.files['ket-qua'] ?? '{X}_ket-qua.md';
+    const file = path.join(seg.dir, pattern.replace(/\{X\}/g, seg.code));
+    const cur = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : undefined;
+    const n = (s?: string) => (s && Number.isFinite(Number(s.replace(',', '.'))) ? Number(s.replace(',', '.')) : undefined);
+    const next = appendAttempt(
+      cur,
+      `${seg.code} · ${seg.name}`,
+      {
+        scene: rs.target.scene,
+        variant: a.variant ?? '',
+        model: a.model ?? '',
+        credit: n(a.credit),
+        seconds: n(a.seconds),
+        marks: (a.marks ?? []).map((x) => parseMark(x) as Mark),
+        usable: parseMark(a.usable ?? ''),
+        note: a.note ?? '',
+      },
+      this.studio.config!.project.attemptLog?.criteria ?? [],
+    );
+    fs.writeFileSync(file, next, 'utf8');
+    vscode.window.showInformationMessage(`Đã ghi một lần sinh ${rs.target.scene} vào ${this.studio.rel(file)}.`);
+    this.studio.refresh();
+  }
+
   // ------------------------------------------------------------------ duyệt theo cấp
   private async approve(undo: boolean): Promise<void> {
     const model = this.studio.model;
@@ -746,6 +1016,8 @@ export class StepPanel {
       <div id="stepper" class="stepper"></div>
       <div id="head"></div>
       <div id="body">
+      <div id="editor"></div>
+      <div id="gridHost" class="card" style="margin-top:8px" hidden>${GRID_BODY}</div>
       <div id="media"></div>
       <div class="row" style="align-items:flex-start;gap:16px;margin-top:8px">
         <div class="col" style="flex:1 1 340px;min-width:280px">
@@ -772,7 +1044,7 @@ export class StepPanel {
         <div id="recent"></div>
       </div>
       </div>`,
-      CLIENT_JS,
+      CLIENT_JS + gridClientJs(true),
     );
   }
 }
@@ -791,6 +1063,9 @@ document.addEventListener('click', (e) => {
   if (sb) vscode.postMessage({ type: 'selectStep', id: sb.dataset.step });
   const ab = e.target.closest('[data-approve]');
   if (ab) vscode.postMessage({ type: 'approve', undo: ab.dataset.approve === 'undo' });
+  if (e.target.closest('#logAttempt')) vscode.postMessage({ type: 'logAttempt', a: {
+    variant: $('aVar').value, model: $('aModel').value, credit: $('aCredit').value, seconds: $('aSec').value,
+    marks: [...document.querySelectorAll('.aMark')].map((x) => x.value), usable: $('aUse').value, note: $('aNote').value } });
   if (e.target.closest('#saveResult')) vscode.postMessage({ type: 'saveResult', result: {
     attempts: $('rAttempts').value, chosen: $('rChosen').value, model: $('rModel').value, note: $('rNote').value } });
 });
@@ -815,8 +1090,9 @@ function renderMedia(md, scene) {
     return '<div class="card" style="width:200px;padding:4px">' + body + '<div style="font-size:.85em;word-break:break-all">' + label + '</div>'
       + '<button class="link" data-cmd="openMedia" data-arg="' + esc(f.abs) + '">mở</button><button class="link" data-cmd="revealMedia" data-arg="' + esc(f.abs) + '">thư mục</button></div>';
   }).join('');
-  let h = '<h2>Media của ' + esc(scene) + ' <span class="muted">' + (md.rootFound ? esc(md.root) : 'không thấy thư mục media ' + esc(md.root || '') + ' — đặt trong Cài đặt AI') + '</span></h2>'
-    + '<div class="row"><button data-cmd="import">Nhập file… (đổi tên theo mã)</button><span class="muted">chép file tải về vào thư mục media, file gốc giữ nguyên</span></div>'
+  let h = '<h2>' + (md.renderOnly ? 'Ảnh / clip render Blender của ' : 'Media của ') + esc(scene) + ' <span class="muted">' + (md.rootFound ? esc(md.root) : 'không thấy thư mục media ' + esc(md.root || '') + ' — đặt trong Cài đặt AI') + '</span></h2>'
+    + (md.renderOnly ? '<p class="muted">File <code>' + esc(scene) + '_R…</code> (clip, key frame) trong thư mục media và seedance_clip/ của tập. Render bằng script ▶ bên dưới.</p>'
+      : '<div class="row"><button data-cmd="import">Nhập file… (đổi tên theo mã)</button><span class="muted">chép file tải về vào thư mục media, file gốc giữ nguyên</span></div>')
     + '<div class="row" style="align-items:flex-start;margin-top:8px">' + (items || '<span class="muted">Chưa có file nào mang mã ' + esc(scene) + '.</span>') + '</div>';
   if (md.full) {
     const r = md.result || {};
@@ -827,9 +1103,152 @@ function renderMedia(md, scene) {
       + '<tr><th>Model video</th><td><input id="rModel" list="mList" size="30" value="' + esc(r.model) + '"><datalist id="mList"><option value="Seedance 2.0 mini"><option value="Seedance 2.0"><option value="Seedance 2.5"><option value="SeeDream 5.0 Pro"><option value="GPT Image 2.5"></datalist></td></tr>'
       + '<tr><th>Lỗi / ghi chú</th><td><textarea id="rNote" style="min-height:48px">' + esc(r.note) + '</textarea></td></tr>'
       + '</table><div class="row" style="margin-top:6px"><button id="saveResult">Lưu kết quả</button>' + (r.updated ? '<span class="muted">ghi lần cuối ' + esc(r.updated) + '</span>' : '') + '</div>';
+    const sel = (cls, id) => '<select' + (cls ? ' class="' + cls + '"' : '') + (id ? ' id="' + id + '"' : '') + '><option value=""></option><option value="✅">✅</option><option value="⚠️">⚠️</option><option value="❌">❌</option></select>';
+    h += '<h2>Ghi một lần sinh <span class="muted">— sổ thử nghiệm · đã ghi ' + (md.logged || 0) + ' lần cho ' + esc(scene) + ' · thống kê ở Trạng thái dự án</span></h2><table>'
+      + '<tr><th>Bản / model</th><td><input id="aVar" size="12" placeholder="vd. A, 3 cảnh"> <input id="aModel" list="mList" size="20" value="' + esc(r.model || 'Seedance 2.0 mini') + '"></td></tr>'
+      + '<tr><th>Credit · giây</th><td><input id="aCredit" type="number" min="0" style="width:80px" placeholder="credit"> <input id="aSec" type="number" min="0" step="0.5" style="width:70px" value="' + esc(md.seconds ?? '') + '"> s</td></tr>'
+      + (md.criteria || []).map((c, k) => '<tr><th>' + '①②③④⑤⑥⑦⑧⑨'[k] + ' ' + esc(c) + '</th><td>' + sel('aMark') + '</td></tr>').join('')
+      + '<tr><th>Dùng được?</th><td>' + sel('', 'aUse') + '</td></tr>'
+      + '<tr><th>Nhận xét</th><td><textarea id="aNote" style="min-height:40px"></textarea></td></tr>'
+      + '</table><div class="row" style="margin-top:6px"><button id="logAttempt">+ Ghi lần sinh</button></div>';
   }
   return h;
 }
+
+// ① form ý tưởng + phong cách · ② kịch bản tóm tắt + danh sách tập. Đang sửa dở (chưa lưu) thì không vẽ lại — giữ chữ đang gõ.
+let edKey = null, edDirty = false, gridOn = null;
+function renderEditor(ed) {
+  const key = ed ? ed.kind + '|' + JSON.stringify(ed) : null;
+  if (ed && edDirty && edKey && edKey.split('|')[0] === ed.kind) { if (ed.kind === 'synopsis') $('epList').innerHTML = epTable(ed); return; }
+  if (key === edKey && ed) { if (ed.kind === 'synopsis') $('epList').innerHTML = epTable(ed); return; }
+  edKey = key; edDirty = false;
+  if (!ed) { $('editor').innerHTML = ''; return; }
+  const dirtyMark = '<span id="edDirty" class="err"></span>';
+  if (ed.kind === 'prompts') {
+    let h = '<h2>Prompt của cảnh ' + esc(ed.scene) + ' <span class="muted">' + (ed.own ? 'mục trong <a data-open="' + esc(ed.own.file) + '" data-line="' + ed.own.line + '">' + esc(ed.own.file) + '</a>' : '') + '</span></h2>';
+    h += ed.own ? '<div class="card">' + mdBlocks(ed.own.text, 'prompt ' + ed.scene) + '</div>' : '<p class="muted">Chưa có mục ' + esc(ed.scene) + ' trong ' + esc(ed.file || 'file prompt của phân đoạn') + ' — bấm Chạy ở mục AI để viết.</p>';
+    if (ed.refs.length) h += '<h2>Ảnh tham chiếu cảnh này nạp <span class="muted">' + ed.refs.length + ' ảnh · prompt tìm trong tham-chieu/ của tập</span></h2>'
+      + ed.refs.map((r) => '<div class="card" style="margin-top:6px"><b>@[' + esc(r.name) + ']</b>'
+        + (r.usedIn.length ? ' <span class="muted">· cũng dùng ở ' + r.usedIn.map(esc).join(', ') + '</span>' : ' <span class="muted">· chỉ cảnh này</span>')
+        + (r.prompt ? (r.prompt.via !== r.name ? ' <span class="muted">· cắt từ @[' + esc(r.prompt.via) + ']</span>' : '') + ' <a data-open="' + esc(r.prompt.file) + '" data-line="' + r.prompt.line + '">' + esc(r.prompt.file) + '</a>' + mdBlocks(r.prompt.text, '@[' + r.prompt.via + ']')
+          : ' <span class="err">chưa thấy prompt</span>') + '</div>').join('');
+    $('editor').innerHTML = h;
+    return;
+  }
+  if (ed.kind === 'render') {
+    const rows = String(ed.rows || '').split('\\n').filter((l) => l.trim().startsWith('|'));
+    $('editor').innerHTML = '<h2>Key frame · clip render <span class="muted">' + (ed.file ? 'dòng trong <a data-open="' + esc(ed.file) + '" data-line="' + ed.line + '">' + esc(ed.file) + '</a>' : '') + '</span></h2>'
+      + (rows.length ? '<table>' + rows.map((l) => '<tr>' + l.trim().replace(/^\\||\\|$/g, '').split('|').map((c) => '<td>' + inlineMd(c.trim()) + '</td>').join('') + '</tr>').join('') + '</table>'
+        : '<p class="muted">Chưa có dòng nào của cảnh này trong sổ render của phân đoạn.</p>');
+    return;
+  }
+  if (ed.kind === 'section') {
+    $('editor').innerHTML = '<h2>Kịch bản của phân đoạn <span class="muted">' + (ed.file ? 'mục trong <a data-open="' + esc(ed.file) + '" data-line="' + ed.line + '">' + esc(ed.file) + '</a>' : '') + (ed.found ? '' : ' · chưa có mục này — lưu là thêm vào cuối file') + '</span></h2>'
+      + '<p class="muted">Xác định nội dung chính của phân đoạn (ý đồ · cảnh trí · hành động · sử liệu · thời lượng). Lưu là ghi lại đúng mục này trong kịch bản chi tiết của tập.</p>'
+      + '<textarea id="secText" style="min-height:320px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+      + '<div class="row" style="margin-top:6px"><button class="sec" id="saveSec">Lưu kịch bản phân đoạn</button>' + dirtyMark
+      + (ed.next ? '<button id="secNext" title="lưu → sang bước sau → AI chạy luôn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu → sang ⑥ → AI chia cảnh (xem diff rồi Nhận, lưới cập nhật)</span>' : '') + '</div>';
+    return;
+  }
+  if (ed.kind === 'outline') {
+    $('editor').innerHTML = '<h2>Dàn ý <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a>' : '') + '</span></h2>'
+      + '<textarea id="olText" style="min-height:360px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+      + '<div class="row" style="margin-top:6px"><button class="sec" id="saveOl">Lưu dàn ý</button>' + dirtyMark
+      + (ed.next ? '<button id="olNext" title="lưu dàn ý → chuyển sang bước sau → AI chạy luôn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu dàn ý → sang ④ → AI chia phân đoạn (xem diff rồi Nhận)</span>' : '') + '</div>';
+    return;
+  }
+  if (ed.kind === 'segments') {
+    $('editor').innerHTML = '<h2>Phân đoạn của tập <span class="muted">' + (ed.readme ? 'bảng trong <a data-open="' + esc(ed.readme) + '">' + esc(ed.readme) + '</a>' : '') + '</span></h2>'
+      + '<p class="muted">AI chia phân đoạn bằng nút <b>✨ Tạo phân đoạn</b> ở mục AI bên dưới (xem diff → Nhận: phân đoạn mới vào bảng, ⬜ chưa duyệt). Đọc · sửa (<b>xem</b> mở đúng mục trong kịch bản) · chọn <b>Đã duyệt</b> → <b>Lưu trạng thái</b> → <b>🎬 Phân cảnh</b>.</p>'
+      + '<div id="segList">' + segTable(ed) + '</div>'
+      + '<div class="row" style="margin-top:6px"><button class="sec" id="saveSeg">Lưu trạng thái</button>' + dirtyMark
+      + '<button id="phanCanh" title="phân đoạn đã duyệt mà chưa có cảnh → tạo mục con + AI chia cảnh">🎬 Phân cảnh</button><span class="muted">tạo mục con cho phân đoạn đã duyệt + AI chia cảnh luôn</span></div>';
+    return;
+  }
+  if (ed.kind === 'idea') {
+    $('editor').innerHTML = '<p class="muted">Lưu vào <a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a> — AI đọc file này ở các bước sau.</p><table style="width:100%">'
+      + ed.fields.map((f, k) => {
+        const v = ed.values[f.label] ?? '';
+        let input;
+        if (f.kind === 'choice') {
+          const opts = (f.choices || []).slice(); if (v && !opts.includes(v)) opts.unshift(v);
+          input = '<select class="ideaF" data-k="' + k + '"><option value=""></option>' + opts.map((o) => '<option' + (o === v ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>'
+            + ' <input class="ideaO" data-k="' + k + '" size="30" placeholder="hoặc gõ loại khác…">';
+        } else input = '<textarea class="ideaF" data-k="' + k + '" style="min-height:' + (f.hint && /dài/.test(f.hint) ? 200 : 110) + 'px">' + esc(v) + '</textarea>';
+        return '<tr><th style="width:170px;vertical-align:top">' + esc(f.label) + (f.hint ? '<div class="muted" style="font-weight:normal">' + esc(f.hint) + '</div>' : '') + '</th><td>' + input + '</td></tr>';
+      }).join('') + '</table><div class="row" style="margin-top:6px"><button id="saveIdea">Lưu ý tưởng + phong cách</button>' + dirtyMark + '</div>';
+    return;
+  }
+  $('editor').innerHTML = '<h2>Kịch bản tóm tắt <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a>' : 'chưa cấu hình synopsis trong project.yaml') + '</span></h2>'
+    + '<textarea id="synText" style="min-height:280px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+    + '<div class="row" style="margin-top:6px"><button id="saveSyn">Lưu kịch bản tóm tắt</button>' + dirtyMark
+    + (ed.runLabel ? '<button data-cmd="run" data-arg="" title="AI đọc ý tưởng + kịch bản tóm tắt + danh sách hiện tại → đề xuất danh sách tập mới; xem diff rồi Nhận">✨ ' + esc(ed.runLabel) + '</button><span class="muted">AI đề xuất → Xem diff → Nhận → sửa tiếp trong lưới</span>' : '') + '</div>'
+    + '<h2>Danh sách tập <button class="sec" data-cmd="episodes">▦ Sửa danh sách tập (thêm · bỏ · đổi thứ tự)</button></h2>'
+    + '<p class="muted">Mã <b>EP</b> = mã sản xuất, cấp một lần, không đổi, bỏ thì không dùng lại · <b>TAP</b> = số phát hành, tool đánh lại theo thứ tự dòng (bỏ qua tập ❌ bỏ / ⏸ chờ).</p>'
+    + '<div id="epList">' + epTable(ed) + '</div>';
+}
+// markdown gọn: khối code (ba dấu huyền) thành <pre> có nút 📋 chép, chữ thường giữ đậm / code
+function inlineMd(t) { return esc(t).replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>').replace(/\\x60([^\\x60]+)\\x60/g, '<code>$1</code>'); }
+let copyN = 0; const copyText = {};
+function mdBlocks(text, label) {
+  const out = []; let buf = [], code = null;
+  for (const l of String(text).split('\\n')) {
+    if (/^\\s*\\x60\\x60\\x60/.test(l)) {
+      if (code === null) { if (buf.length) out.push('<p>' + buf.map(inlineMd).join('<br>') + '</p>'); buf = []; code = []; }
+      else { const k = 'c' + (++copyN); copyText[k] = code.join('\\n');
+        out.push('<div style="position:relative"><button class="sec" data-copy="' + k + '" data-label="' + esc(label) + '" style="position:absolute;right:4px;top:4px">📋 chép</button><pre style="white-space:pre-wrap;padding-right:80px">' + esc(code.join('\\n')) + '</pre></div>'); code = null; }
+      continue;
+    }
+    if (code !== null) code.push(l); else if (/^#{1,6}\\s/.test(l)) { if (buf.length) out.push('<p>' + buf.map(inlineMd).join('<br>') + '</p>'); buf = []; out.push('<h3>' + inlineMd(l.replace(/^#+\\s*/, '')) + '</h3>'); } else if (l.trim()) buf.push(l); else if (buf.length) { out.push('<p>' + buf.map(inlineMd).join('<br>') + '</p>'); buf = []; }
+  }
+  if (buf.length) out.push('<p>' + buf.map(inlineMd).join('<br>') + '</p>');
+  return out.join('');
+}
+document.addEventListener('click', (e) => {
+  const c = e.target.closest('[data-copy]');
+  if (c) vscode.postMessage({ type: 'copy', text: copyText[c.dataset.copy], label: c.dataset.label });
+});
+function segTable(ed) {
+  if (!ed.segments.length) return '<p class="muted">Chưa có phân đoạn — bấm ✨ Tạo phân đoạn.</p>';
+  return '<table><tr><th>Mã</th><th>Phân đoạn</th><th>~Giây</th><th>Trạng thái</th><th>Cảnh</th><th></th></tr>' + ed.segments.map((x) =>
+    '<tr' + (x.dropped ? ' style="opacity:.5"' : '') + '><td><b>' + esc(x.code) + '</b></td><td>' + esc(x.name) + '<div class="muted" style="font-size:.85em">' + esc(x.note) + '</div></td><td>' + esc(x.seconds ?? '') + '</td><td>'
+    + (x.dropped ? '❌ bỏ' : '<select class="segSt" data-code="' + esc(x.code) + '" data-orig="' + esc(x.status) + '">' + ed.choices.map((o) => '<option value="' + esc(o.value) + '"' + (o.value === x.status ? ' selected' : '') + '>' + esc(o.value + ' ' + o.label) + '</option>').join('') + '</select>')
+    + '</td><td>' + (x.scenes ? x.scenes + ' cảnh' : x.hasDir ? '<span class="muted">chưa chia</span>' : '<span class="muted">chưa có mục con</span>') + '</td><td>'
+    + (ed.script ? '<button class="link" data-open="' + esc(ed.script) + '" data-line="' + x.line + '">xem</button>' : '')
+    + (x.hasDir ? '<button class="link" data-cmd="target" data-arg="' + esc(JSON.stringify({ ep: ed.ep, seg: x.code })) + '">mở</button>' : '') + '</td></tr>').join('') + '</table>';
+}
+function epTable(ed) {
+  if (!ed.episodes.length) return '<p class="muted">Chưa có tập nào' + (ed.listFile ? ' trong ' + esc(ed.listFile) : '') + '.</p>';
+  return '<table><tr><th>Mã</th><th>Phát hành</th><th>Tên tập</th><th>Trạng thái</th><th>Lịch</th><th>Thư mục</th></tr>' + ed.episodes.map((e) =>
+    '<tr' + (e.dropped ? ' style="opacity:.5"' : '') + '><td>' + esc(e.code) + '</td><td>' + esc(e.release || '—') + '</td><td>' + esc(e.name) + '</td><td>' + esc(e.status) + '</td><td>' + esc(e.date) + '</td><td>'
+    + (e.dir ? '<a data-cmd="target" data-arg="' + esc(JSON.stringify({ ep: e.code })) + '">mở</a>' : '<span class="muted">chưa có</span>') + '</td></tr>').join('') + '</table>';
+}
+document.addEventListener('input', (e) => {
+  if (e.target.closest('#editor') && (e.target.matches('.ideaF, .ideaO, #synText, #olText, #secText'))) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
+});
+document.addEventListener('change', (e) => {
+  if (e.target.matches && e.target.matches('select.ideaF, select.segSt')) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
+});
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'saveIdea') {
+    const values = {};
+    document.querySelectorAll('.ideaF').forEach((x) => {
+      const k = +x.dataset.k, other = document.querySelector('.ideaO[data-k="' + k + '"]');
+      values[k] = other && other.value.trim() ? other.value.trim() : x.value;
+    });
+    edDirty = false; edKey = null;
+    vscode.postMessage({ type: 'saveIdea', values: values, byIndex: true });
+  }
+  if (e.target.id === 'saveSec' || e.target.id === 'secNext') { edDirty = false; edKey = null; vscode.postMessage({ type: 'saveSection', text: $('secText').value, next: e.target.id === 'secNext' }); }
+  if (e.target.id === 'saveOl' || e.target.id === 'olNext') { edDirty = false; edKey = null; vscode.postMessage({ type: 'saveOutline', text: $('olText').value, next: e.target.id === 'olNext' }); }
+  if (e.target.id === 'saveSeg') {
+    const changes = {};
+    document.querySelectorAll('.segSt').forEach((x) => { if (x.value !== x.dataset.orig) changes[x.dataset.code] = x.value; });
+    edDirty = false; edKey = null; vscode.postMessage({ type: 'segStatus', changes });
+  }
+  if (e.target.id === 'phanCanh') vscode.postMessage({ type: 'phanCanh' });
+  if (e.target.id === 'saveSyn') { edDirty = false; edKey = null; vscode.postMessage({ type: 'saveSynopsis', text: $('synText').value }); }
+});
 
 function renderTop(vm) {
   const o = vm.overview;
@@ -873,8 +1292,15 @@ function render(vm) {
   if (!vm.gate.ok) h += '<p class="warn">🔒 Cổng chưa mở: ' + vm.gate.reasons.map(esc).join(' · ') + '</p>';
   $('head').innerHTML = h;
   $('media').innerHTML = renderMedia(vm.media, vm.target.scene);
+  renderEditor(vm.editor);
+  // ⑥ Phân cảnh: lưới bảng cảnh ngay trong tab
+  $('gridHost').hidden = !vm.grid;
+  const gk = vm.grid ? vm.gridKind : null;
+  if (gk && gk !== gridOn) window.gridReload();
+  gridOn = gk;
 
-  $('files').innerHTML = '<table>' + vm.files.map((f) => {
+  const sh = vm.files.filter((f) => f.shared);
+  $('files').innerHTML = '<table>' + vm.files.filter((f) => !f.shared).map((f) => {
     const state = f.virtual ? '<span class="muted">' + f.chars + ' ký tự</span>'
       : !f.exists ? (f.optional ? '<span class="muted">không có</span>' : '<span class="err">chưa có</span>')
       : !f.found ? '<span class="err">không thấy mục</span>' : '<span class="muted">' + f.chars + ' ký tự</span>';
@@ -884,8 +1310,10 @@ function render(vm) {
       + '<button class="link" data-open="' + esc(f.abs) + '" data-line="' + f.line + '">sửa</button>';
     else if (f.role === 'output') btn = '<button class="link" data-cmd="create">tạo file</button>';
     return '<tr><td>' + (f.role === 'output' ? '→ ' : '') + esc(f.label) + '</td><td>' + state + '</td><td style="white-space:nowrap">' + btn + '</td></tr>';
-  }).join('') + '</table>';
-  $('tools').innerHTML = vm.grid ? '<div style="margin-top:8px"><button class="sec" data-cmd="grid">▦ Sửa bảng cảnh dạng lưới</button></div>' : '';
+  }).join('') + '</table>'
+    + (sh.length ? '<details class="muted" style="margin-top:4px"><summary>📚 + ' + sh.length + ' tài liệu dùng chung — ở Tài nguyên dự án, AI vẫn đọc khi chạy</summary>'
+      + sh.map((f) => '<div>' + esc(f.label) + ' <button class="link" data-cmd="show" data-arg="' + f.i + '">xem</button></div>').join('') + '</details>' : '');
+  $('tools').innerHTML = vm.grid ? '<div style="margin-top:8px"><button class="link" data-cmd="grid">▦ mở lưới ở tab riêng</button></div>' : '';
 
   $('notes').innerHTML = vm.notes.length ? '<h2>Ghi chú trong các file này</h2>' + vm.notes.map((n) =>
     '<div><span class="badge">' + (n.kind === 'todo' ? '@C' : '@T') + '</span> <a data-open="' + esc(n.file) + '" data-line="' + n.line + '">'
@@ -905,7 +1333,7 @@ function render(vm) {
   if (vm.step.executor === 'agent') a = '<button data-cmd="handoff">Giao cho Claude Code (terminal)</button>';
   else if (vm.hasOutput) {
     const skip = vm.gate.ok ? '' : 'skip';
-    a = '<button data-cmd="run" data-arg="' + skip + '">' + (vm.gate.ok ? 'Chạy' : 'Chạy (bỏ qua cổng)') + '</button>'
+    a = '<button data-cmd="run" data-arg="' + skip + '">' + (vm.gate.ok ? (vm.step.runLabel || 'Chạy') : (vm.step.runLabel || 'Chạy') + ' (bỏ qua cổng)') + '</button>'
       + (vm.compare ? ' <button class="sec" data-cmd="runCompare" data-arg="' + skip + '">Chạy cả 2 để so sánh</button>' : '');
   }
   $('actions').innerHTML = a;

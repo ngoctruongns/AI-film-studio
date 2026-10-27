@@ -7,7 +7,8 @@ import { STUDIO_DIR, ScriptSpec, hasStudio } from '../core/config';
 import { ledgerPath, loadLedger, nextSceneCode, nextSegmentCode, reserveScene, reserveSegment, saveLedger } from '../core/codes';
 import { applyManagedBlock } from '../core/gitignore';
 import { runsDir } from '../core/runs';
-import { Episode, Segment, fill, placeholdersFor } from '../core/scanner';
+import { Episode, Segment, episodeLabel, fill, placeholdersFor } from '../core/scanner';
+import { GridPanel } from './gridPanel';
 import { Studio } from './studio';
 
 function git(cwd: string, args: string[]): Promise<string> {
@@ -16,7 +17,7 @@ function git(cwd: string, args: string[]): Promise<string> {
   );
 }
 
-function copyDir(src: string, dst: string, skip: (rel: string) => boolean, rename: (name: string) => string, transform: (text: string) => string, rel = ''): void {
+export function copyDir(src: string, dst: string, skip: (rel: string) => boolean, rename: (name: string) => string, transform: (text: string) => string, rel = ''): void {
   fs.mkdirSync(dst, { recursive: true });
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
     const r = rel ? `${rel}/${e.name}` : e.name;
@@ -33,7 +34,7 @@ function copyDir(src: string, dst: string, skip: (rel: string) => boolean, renam
 async function pickEpisode(studio: Studio, arg?: { ep?: Episode }): Promise<Episode | undefined> {
   if (arg?.ep) return arg.ep;
   const eps = studio.model?.episodes.filter((e) => !e.legacy) ?? [];
-  const p = await vscode.window.showQuickPick(eps.map((e) => ({ label: e.id, description: e.slug, e })), { placeHolder: 'Tập nào?' });
+  const p = await vscode.window.showQuickPick(eps.map((e) => ({ label: episodeLabel(e), description: e.id, e })), { placeHolder: 'Tập nào?' });
   return p?.e;
 }
 
@@ -44,6 +45,22 @@ async function pickSegment(studio: Studio, ep: Episode, arg?: { seg?: Segment })
     { placeHolder: 'Phân đoạn nào?' },
   );
   return p?.s;
+}
+
+/** Tạo thư mục phân đoạn từ mẫu — mẫu dùng mã 'A' → đổi sang mã mới cả trong tên file lẫn nội dung (A_canh.md → K_canh.md, A01 → K01). */
+export function createSegmentDir(studio: Studio, ep: Episode, code: string, slug: string): string {
+  const p = studio.model!.config.project;
+  const dst = path.join(ep.dir, p.segment.dir, `${code}_${slug}`);
+  if (p.segment.template && studio.exists(p.segment.template)) {
+    copyDir(
+      studio.abs(p.segment.template),
+      dst,
+      () => false,
+      (n) => n.replace(/^A_/, `${code}_`),
+      (t) => t.replace(/\bA(\d{2})/g, `${code}$1`).replace(/\bA_/g, `${code}_`),
+    );
+  } else fs.mkdirSync(dst, { recursive: true });
+  return dst;
 }
 
 export function registerCommands(context: vscode.ExtensionContext, studio: Studio): void {
@@ -119,6 +136,8 @@ export function registerCommands(context: vscode.ExtensionContext, studio: Studi
   reg('aiFilmStudio.newEpisode', async () => {
     if (!studio.model) return;
     const p = studio.model.config.project;
+    // có danh sách tập → thêm tập trong lưới (tool cấp mã EP kế tiếp, nút 📁 tạo thư mục)
+    if (p.episodeList) return GridPanel.open(studio);
     const nn = await vscode.window.showInputBox({ prompt: 'Số tập (vd. 02)', validateInput: (v) => (/^\d{1,2}$/.test(v) ? undefined : 'Nhập số') });
     if (!nn) return;
     const slug = await vscode.window.showInputBox({ prompt: 'Tên ngắn không dấu, nối gạch (vd. Sach-Vo-Thanh-Tro)' });
@@ -145,18 +164,7 @@ export function registerCommands(context: vscode.ExtensionContext, studio: Studi
     if (!code) return vscode.window.showErrorMessage('Hết chữ A–Z cho phân đoạn.');
     const slug = await vscode.window.showInputBox({ prompt: `Phân đoạn mới mã ${code} — tên ngắn không dấu (vd. tay-do-bi-pha)` });
     if (!slug) return;
-    const p = studio.model.config.project;
-    const dst = path.join(ep.dir, p.segment.dir, `${code}_${slug}`);
-    if (p.segment.template && studio.exists(p.segment.template)) {
-      // Mẫu dùng mã 'A' → đổi sang mã mới cả trong tên file lẫn nội dung (A_canh.md → K_canh.md, A01 → K01)
-      copyDir(
-        studio.abs(p.segment.template),
-        dst,
-        () => false,
-        (n) => n.replace(/^A_/, `${code}_`),
-        (t) => t.replace(/\bA(\d{2})/g, `${code}$1`).replace(/\bA_/g, `${code}_`),
-      );
-    } else fs.mkdirSync(dst, { recursive: true });
+    const dst = createSegmentDir(studio, ep, code, slug);
     reserveSegment(ledger, ep.id, code);
     saveLedger(lp, ledger);
     studio.refresh();

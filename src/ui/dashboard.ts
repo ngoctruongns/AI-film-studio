@@ -1,5 +1,6 @@
-// Tab Tổng quan: tiến độ các tập, ma trận phân đoạn × bước của tập đang chọn, thời lượng, lịch phát hành, chi phí AI.
+// Tab Trạng thái dự án: tiến độ các tập, ma trận phân đoạn × bước của tập đang chọn, thời lượng, lịch phát hành, chi phí AI.
 import * as fs from 'fs';
+import { attemptStats } from '../core/attempts';
 import * as vscode from 'vscode';
 import { STATUS_LABEL, STATUS_ORDER, StatusKey, statusSymbol } from '../core/config';
 import { findSection, formatDuration, parseHeadings } from '../core/markdown';
@@ -10,13 +11,10 @@ import { esc, handleOpen, shell } from './webview';
 
 /** Cột của ma trận phân đoạn: bước → cách tính ô */
 const SEG_COLUMNS: { step: string; label: string; file?: string }[] = [
-  { step: 'kich-ban', label: '③ Kịch bản' },
-  { step: 'chia-canh', label: '④ Cảnh', file: 'canh' },
-  { step: 'loi', label: '⑤a Lời', file: 'loi' },
-  { step: 'am-thanh', label: '⑤b Âm', file: 'am-thanh' },
-  { step: 'dung', label: '⑤c Dựng', file: 'dung' },
-  { step: 'prompt', label: '⑤d Prompt', file: 'prompt' },
-  { step: 'ket-qua', label: '⑦ Kết quả', file: 'ket-qua' },
+  { step: 'kich-ban', label: '⑤ Kịch bản' },
+  { step: 'chia-canh', label: '⑥ Cảnh', file: 'canh' },
+  { step: 'loi', label: '⑦ Lời', file: 'loi' },
+  { step: 'dung', label: '⑧ Dựng', file: 'dung' },
 ];
 
 export class Dashboard {
@@ -28,7 +26,7 @@ export class Dashboard {
       this.panel.reveal();
       return;
     }
-    const panel = vscode.window.createWebviewPanel('aiFilmStudio.dashboard', 'Tổng quan dự án', vscode.ViewColumn.Active, {
+    const panel = vscode.window.createWebviewPanel('aiFilmStudio.dashboard', 'Trạng thái dự án', vscode.ViewColumn.Active, {
       enableScripts: true,
       retainContextWhenHidden: true,
     });
@@ -57,7 +55,7 @@ export class Dashboard {
 
   private static html(studio: Studio, webview: vscode.Webview): string {
     const model = studio.model;
-    if (!model) return shell(webview, 'Tổng quan', `<h1>AI Film Studio</h1><p class="err">${esc(studio.error ?? 'Chưa nạp dự án')}</p>`);
+    if (!model) return shell(webview, 'Trạng thái dự án', `<h1>AI Film Studio</h1><p class="err">${esc(studio.error ?? 'Chưa nạp dự án')}</p>`);
     const p = model.config.project;
     const st = p.status;
     const cap = p.episodeCapSeconds;
@@ -89,7 +87,7 @@ export class Dashboard {
       ${tile('Cảnh duyệt ✅', `${done} / ${allScenes.length}`, allScenes.length ? `${Math.round((done / allScenes.length) * 100)}%` : '')}
       ${tile('Lần sinh video / cảnh', avgV !== undefined ? avgV.toFixed(1) : '—', `${withV.length} cảnh đã sinh · ${chosen} có bản chốt${model.mediaFound ? '' : ' · không thấy thư mục media'}`)}
       ${tile('Ghi chú', `@C ${todo} · @T ${ask}`, 'xem ở sidebar')}
-      ${tile('Tập phát hành kế tiếp', nextRelease ? nextRelease.id : '—', days !== undefined ? `còn ${days} ngày (${nextRelease!.releaseDate!.toLocaleDateString('vi-VN')})` : '')}
+      ${tile('Tập phát hành kế tiếp', nextRelease ? `${nextRelease.release ?? ''} · ${nextRelease.id}` : '—', days !== undefined ? `còn ${days} ngày (${nextRelease!.releaseDate!.toLocaleDateString('vi-VN')})` : '')}
       ${tile('Chi phí AI tháng này', `${costMonth.usd.toFixed(2)} USD`, `${costMonth.runs} lần chạy · tổng ${costAll.usd.toFixed(2)} USD`)}
       ${tile('Soát nhất quán', String(studio.issues.length), 'xem ở tab Problems')}
     </div>`;
@@ -101,18 +99,19 @@ export class Dashboard {
       return STATUS_ORDER.map((k) => `<td style="text-align:center">${count(k) || ''}</td>`).join('');
     };
     const epRows = model.episodes
+      .filter((e) => !e.dropped || !e.legacy)
       .map((e) => {
         const segs = e.segments.filter((s) => !s.dropped);
         const sc = segs.flatMap((s) => s.scenes);
         const over = cap && e.sceneSeconds > cap;
         const late = e.releaseDate && e.releaseDate < now;
         return `<tr ${e === sel ? 'style="outline:2px solid var(--vscode-focusBorder)"' : ''}>
-          <td><a data-cmd="episode" data-arg="${e.id}"><b>${e.id}</b></a> <span class="muted">${esc(e.slug.replace(/-/g, ' '))}</span></td>
+          <td><a data-cmd="episode" data-arg="${e.id}"><b>${esc(e.release ?? e.id)}</b></a> ${esc(e.title || e.slug.replace(/-/g, ' '))} <span class="muted">${e.id}</span></td>
           <td>${e.legacy ? '<span class="muted">cấu trúc cũ</span>' : `${segs.length}`}</td>
           <td>${e.legacy ? '' : sc.length}</td>
           ${e.legacy ? `<td colspan="${STATUS_ORDER.length}"></td>` : statusCells(e)}
           <td class="${over ? 'err' : ''}">${e.sceneSeconds ? formatDuration(e.sceneSeconds) : ''}${e.plannedSeconds ? ` <span class="muted">/ dự kiến ${formatDuration(e.plannedSeconds)}</span>` : ''}</td>
-          <td class="${late ? 'err' : ''}">${e.releaseDate ? e.releaseDate.toLocaleDateString('vi-VN') : ''}</td>
+          <td class="${late ? 'err' : ''}">${e.release ? `<b>${esc(e.release)}</b> ` : e.dropped ? '<span class="muted">bỏ</span>' : ''}${e.releaseDate ? e.releaseDate.toLocaleDateString('vi-VN') : ''}</td>
         </tr>`;
       })
       .join('');
@@ -120,13 +119,44 @@ export class Dashboard {
       <tr><th>Tập</th><th>Đoạn</th><th>Cảnh</th>${STATUS_ORDER.map((k) => `<th title="${STATUS_LABEL[k]}">${statusSymbol(k, st)}</th>`).join('')}
       <th>Giây cảnh ${cap ? `(trần ${formatDuration(cap)})` : ''}</th><th>Phát hành</th></tr>${epRows}</table></div>`;
 
+    // ----- sổ thử nghiệm (mỗi lần sinh một dòng) — core/attempts.ts
+    const logRows = live.flatMap((e) => e.segments.flatMap((s) => s.attempts.map((a) => ({ ...a, scene: `${e.id} ${a.scene}` }))));
+    let logHtml = '';
+    if (logRows.length) {
+      const stt = attemptStats(logRows, p.attemptLog?.criteria ?? []);
+      const pct = (a: number, b: number) => (b ? `${Math.round((a / b) * 100)}%` : '—');
+      const models = stt.byModel
+        .map((g) => `<tr><td>${esc(g.key)}</td><td>${g.attempts}</td><td>${g.usable} <span class="muted">(${pct(g.usable, g.attempts)})</span></td>
+          <td>${g.credit ? Math.round(g.credit / g.attempts) : '—'}</td><td>${g.credit && g.usableSeconds ? (g.credit / g.usableSeconds).toFixed(1) : '—'}</td></tr>`)
+        .join('');
+      const crit = stt.criteria
+        .filter((c) => c.bad || c.warn)
+        .map((c) => `<tr><td>${esc(c.label)}</td><td class="${c.bad ? 'err' : ''}">${c.bad || ''}</td><td>${c.warn || ''}</td></tr>`)
+        .join('');
+      const scenes = stt.scenes
+        .map((x) => `<tr><td>${esc(x.scene)}</td><td>${x.attempts}</td><td>${x.firstUsable ? `lần ${x.firstUsable}` : '<span class="err">chưa đạt</span>'}</td><td>${x.credit || ''}</td></tr>`)
+        .join('');
+      logHtml = `<h2>Sổ thử nghiệm <span class="muted">— bảng "Nhật ký lần sinh" trong các file của phân đoạn</span></h2>
+        <div class="row">
+          ${tile('Lần sinh tới bản dùng được', stt.avgToUsable !== undefined ? stt.avgToUsable.toFixed(1) : '—', `${stt.scenes.length - stt.failing.length} cảnh đạt · ${stt.failing.length} chưa đạt`)}
+          ${tile('Tỉ lệ dùng được', pct(stt.usable, stt.total), `${stt.usable} / ${stt.total} lần sinh`)}
+          ${tile('Credit / giây dùng được', stt.creditPerUsableSecond !== undefined ? stt.creditPerUsableSecond.toFixed(1) : '—', `tổng ${stt.credit} credit`)}
+        </div>
+        <div class="row" style="align-items:flex-start">
+          <div class="scroll-x"><table><tr><th>Model</th><th>Lần</th><th>Dùng được</th><th>Credit / lần</th><th>Credit / giây dùng được</th></tr>${models}</table></div>
+          ${crit ? `<div class="scroll-x"><table><tr><th>Tiêu chí hay hỏng nhất</th><th>❌</th><th>⚠️</th></tr>${crit}</table></div>` : ''}
+          <div class="scroll-x"><table><tr><th>Cảnh</th><th>Lần</th><th>Dùng được từ</th><th>Credit</th></tr>${scenes}</table></div>
+        </div>`;
+    }
+
     return shell(
       webview,
-      'Tổng quan',
+      'Trạng thái dự án',
       `<div class="row" style="justify-content:space-between"><h1>${esc(p.name)}</h1>
         <span class="muted">quét lúc ${model.scannedAt.toLocaleTimeString('vi-VN')} <button class="link" data-cmd="refresh">quét lại</button>
         <button class="link" data-cmd="settings">cài đặt AI</button><button class="link" data-cmd="endSession">kết thúc phiên</button></span></div>
       ${tiles}
+      ${logHtml}
       <h2>Các tập</h2>${epTable}
       ${sel ? this.episodeDetail(studio, sel) : ''}`,
     );

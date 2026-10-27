@@ -72,6 +72,7 @@ export function activate(context: vscode.ExtensionContext): void {
     );
     if (pick) openStep(pick.s.id, target);
   });
+  reg('aiFilmStudio.editEpisodeList', () => studio.model && GridPanel.open(studio));
   reg('aiFilmStudio.editSceneTable', async (arg?: ProjectNode | { ep?: string; seg?: string }) => {
     let ep: string | undefined;
     let seg: string | undefined;

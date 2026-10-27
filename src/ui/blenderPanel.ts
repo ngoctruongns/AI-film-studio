@@ -6,7 +6,7 @@ import { BlenderModel, DUMP_PY, gotoShotPy, parseDump, renderCommandFor, renderR
 import { runBlenderCli, runInBlenderSocket } from '../core/blenderLink';
 import { listSceneMedia } from '../core/results';
 import { runsDir } from '../core/runs';
-import { Episode, fill, findEpisode, placeholdersFor } from '../core/scanner';
+import { Episode, episodeLabel, fill, findEpisode, placeholdersFor } from '../core/scanner';
 import { Studio } from './studio';
 import { shell } from './webview';
 
@@ -94,7 +94,7 @@ export class BlenderPanel {
     ];
     return {
       ep: ep.id,
-      title: `${ep.id} ${ep.slug.replace(/-/g, ' ')}`,
+      title: episodeLabel(ep),
       fps: bm.cfg.fps,
       blender: b,
       register: { abs: bm.registerFile, rel: this.studio.rel(bm.registerFile), exists: bm.registerExists },
@@ -166,7 +166,7 @@ export class BlenderPanel {
         const mine = this.bm?.files.some((f) => f.name === name);
         if (!mine) {
           const pick = await vscode.window.showQuickPick(
-            model.episodes.filter((e) => !e.legacy).map((e) => ({ label: e.id, description: e.slug, e: e.id })),
+            model.episodes.filter((e) => !e.legacy).map((e) => ({ label: e.id, description: episodeLabel(e), e: e.id })),
             { placeHolder: `${name} chưa thấy trong ${this.epId} — lưu kết quả quét vào tập nào?` },
           );
           if (!pick) return this.status('đã hủy');
@@ -243,7 +243,7 @@ export class BlenderPanel {
     const ep = this.ep();
     if (!ep || !this.bm) return;
     const secs = new Map(ep.segments.flatMap((s) => s.scenes.map((c) => [c.code, c.seconds] as const)));
-    const text = renderRegister(this.bm, `${ep.id} ${ep.slug.replace(/-/g, ' ')}`, (sc) => secs.get(sc));
+    const text = renderRegister(this.bm, `${ep.id} · ${episodeLabel(ep)}`, (sc) => secs.get(sc));
     const file = this.bm.registerFile;
     const cur = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
     if (cur === text) return this.status('sổ đã đúng, không cần ghi');

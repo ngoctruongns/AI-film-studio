@@ -83,3 +83,8 @@ export function reserveScene(ledger: Ledger, ep: string, code: string): void {
   addUnique(e.segments, m[1]);
   addUnique((e.scenes[m[1]] ??= []), Number(m[2]));
 }
+
+/** Ghi mã tập (EP07) vào sổ — tập đã cấp mã, kể cả chưa có thư mục hay đã bỏ, không cấp lại. */
+export function reserveEpisode(ledger: Ledger, ep: string): void {
+  entry(ledger, ep);
+}

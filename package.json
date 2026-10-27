@@ -2,7 +2,7 @@
   "name": "ai-film-studio",
   "displayName": "AI Film Studio",
   "description": "Quản lý pipeline làm phim AI: kịch bản → phân đoạn → cảnh → hồ sơ cảnh → prompt ảnh/video. Mỗi việc một tab, chọn model AI cho từng bước, dashboard tiến độ.",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "publisher": "ngoctruongns",
   "license": "UNLICENSED",
   "repository": {
@@ -52,7 +52,7 @@
     "commands": [
       {
         "command": "aiFilmStudio.openDashboard",
-        "title": "Mở tổng quan dự án",
+        "title": "Mở trạng thái dự án",
         "category": "AI Film Studio",
         "icon": "$(dashboard)"
       },
@@ -88,6 +88,11 @@
         "title": "Bắt đầu việc (git diff + git add -A)",
         "category": "AI Film Studio",
         "icon": "$(git-commit)"
+      },
+      {
+        "command": "aiFilmStudio.editEpisodeList",
+        "title": "Sửa danh sách tập (mã EP · số phát hành TAP)",
+        "category": "AI Film Studio"
       },
       {
         "command": "aiFilmStudio.newEpisode",

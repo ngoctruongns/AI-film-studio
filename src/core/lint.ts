@@ -1,8 +1,9 @@
 // Soát nhất quán không cần AI: giây cảnh, trần tập, mã lời, @[TÊN], từ cấm.
 import * as fs from 'fs';
-import { formatDuration } from './markdown';
+import { columnIndex, formatDuration, parseTables } from './markdown';
 import { scanBlender } from './blender';
-import { ProjectModel } from './scanner';
+import { ProjectModel, listMd } from './scanner';
+import { lintPromptText } from './promptLint';
 
 export interface Issue {
   file: string;
@@ -52,6 +53,12 @@ export function lintProject(model: ProjectModel): Issue[] {
     for (const seg of ep.segments) {
       if (seg.dropped) continue;
       const sceneCodes = new Set(seg.scenes.map((s) => s.code));
+      // bảng lưới chỉ sửa được BẢNG ĐẦU của _canh.md → nhiều bảng cảnh là ẩn mất cảnh
+      const canh = seg.files[p.sceneTable.file];
+      if (canh) {
+        const tabs = parseTables(fs.readFileSync(canh, 'utf8')).filter((t) => columnIndex(t, p.sceneTable.codeColumn) >= 0 && columnIndex(t, p.sceneTable.secondsColumn) >= 0);
+        if (tabs.length > 1) issues.push({ file: canh, line: tabs[1].line, severity: 'warning', message: `Có ${tabs.length} bảng cảnh — bảng lưới chỉ sửa bảng đầu; gộp thành một bảng theo thứ tự chiếu` });
+      }
       for (const sc of seg.scenes) {
         if (sc.status === 'dropped') continue;
         if (sc.segment !== seg.code) {
@@ -59,6 +66,15 @@ export function lintProject(model: ProjectModel): Issue[] {
         }
         if (sc.seconds !== undefined && (sc.seconds < min || sc.seconds > max)) {
           issues.push({ file: sc.file, line: sc.line, severity: 'warning', message: `Cảnh ${sc.code}: ${sc.seconds} s ngoài khoảng ${min}–${max} s` });
+        }
+      }
+
+      // prompt video (Seedance) — mọi file .md của phân đoạn có khối 【Cảnh k】
+      if (p.promptLint && seg.dir) {
+        for (const f of listMd(seg.dir)) {
+          const text = fs.readFileSync(f, 'utf8');
+          if (!/【(?:Cảnh|Đoạn)/.test(text)) continue;
+          for (const pi of lintPromptText(text, p.promptLint)) issues.push({ file: f, line: pi.line, severity: pi.severity, message: pi.message });
         }
       }
 

@@ -4,6 +4,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import YAML from 'yaml';
+import type { AttemptLogConfig } from './attempts';
+import type { EpisodeListConfig } from './episodeList';
+import type { IdeaConfig } from './idea';
+import type { ResourceGroup } from './resources';
+import type { PromptLintConfig } from './promptLint';
 
 export const STUDIO_DIR = '.studio';
 
@@ -58,7 +63,15 @@ export interface ProjectConfig {
     template?: string;
   };
   /** suggest: gợi ý cho ô của lưới bảng cảnh — tên cột → danh sách giá trị */
-  sceneTable: TableSpec & { minSeconds?: number; maxSeconds?: number; suggest?: Record<string, string[]> };
+  sceneTable: TableSpec & {
+    minSeconds?: number;
+    maxSeconds?: number;
+    suggest?: Record<string, string[]>;
+    /** lựa chọn của ô Trạng thái trong lưới (giá trị ghi vào file · nhãn hiện) — không có thì ô gõ tự do */
+    statusChoices?: { value: string; label: string }[];
+    /** độ rộng mặc định của cột trong lưới (px), theo tên cột */
+    columnWidths?: Record<string, number>;
+  };
   codes: {
     segment: string;
     scene: string;
@@ -79,7 +92,23 @@ export interface ProjectConfig {
     everyDays: number;
     firstEpisode: number;
   };
+  /** Tài nguyên dự án — tài liệu dùng chung, gom theo nhóm — core/resources.ts */
+  resources?: ResourceGroup[];
+  /** bước ①: form ý tưởng + phong cách — core/idea.ts */
+  idea?: IdeaConfig;
+  /** bước ②: file kịch bản tóm tắt cả phim (sửa trong tab) */
+  synopsis?: string;
+  /** bước ②: danh sách tập — mã sản xuất EPnn + số phát hành TAPnn — core/episodeList.ts */
+  episodeList?: EpisodeListConfig;
+  /** ⑦ lưới bảng lời <X>_loi.md */
+  linesTable?: { codeColumn: string; nameColumn?: string; statusColumn?: string; columnWidths?: Record<string, number>; suggest?: Record<string, string[]> };
+  /** ⑨ prompt của cảnh + ảnh dùng chung — core/scenePrompts.ts */
+  scenePrompts?: import('./scenePrompts').ScenePromptConfig;
   forbiddenWords?: string[];
+  /** soát prompt video — core/promptLint.ts */
+  promptLint?: PromptLintConfig;
+  /** sổ thử nghiệm — core/attempts.ts */
+  attemptLog?: AttemptLogConfig;
   gitignore?: string[];
   scripts?: ScriptSpec[];
   /** File nạp làm "lõi dự án" cho model không tự đọc repo */
@@ -119,8 +148,15 @@ export interface StepSpec {
   inputs?: FileRef[];
   /** replace = cả file · section = thay mục 'heading:…' · insert = chèn ngay dưới tiêu đề mục (sau dòng trích dẫn) */
   output?: FileRef & { mode?: 'replace' | 'section' | 'insert' };
-  /** Phần giao diện thêm trong tab: media = lưới ảnh/clip + ghi kết quả · grid = nút sửa bảng cảnh dạng lưới */
-  view?: ('media' | 'grid')[];
+  /** Phần giao diện thêm trong tab: media = lưới ảnh/clip + ghi kết quả · grid = lưới bảng cảnh ngay trong tab ·
+   *  idea = form ý tưởng + phong cách · synopsis = sửa kịch bản tóm tắt + danh sách tập ·
+   *  outline = sửa dàn ý tập (file đầu vào thứ nhất) · section = sửa mục đầu ra (kịch bản phân đoạn) · lines = lưới bảng lời trong tab ·
+   *  prompts = prompt cảnh + ảnh dùng chung, nút chép · render = key frame / clip render + ảnh render của cảnh · segments = bảng phân đoạn của tập: duyệt từng dòng + "Phân cảnh" */
+  view?: ('media' | 'grid' | 'lines' | 'idea' | 'synopsis' | 'outline' | 'segments' | 'section' | 'prompts' | 'render')[];
+  /** nút chuyển sang bước sau và chạy AI luôn, vd. ③ Dàn ý → "Tạo phân đoạn" → ④ */
+  next?: { step: string; label: string };
+  /** chữ trên nút chạy AI (mặc định "Chạy"), vd. "Chia tập" */
+  runLabel?: string;
   gate?: StepGate;
   /** Đường dẫn mẫu prompt, tương đối thư mục .studio/ */
   prompt?: string;

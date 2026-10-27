@@ -4,13 +4,18 @@ import * as vscode from 'vscode';
 import { Scope, STATUS_LABEL, statusSymbol } from '../core/config';
 import { StepTarget } from '../core/context';
 import { formatDuration } from '../core/markdown';
-import { Episode, Scene, Segment } from '../core/scanner';
+import { Episode, Scene, Segment, episodeLabel } from '../core/scanner';
 import { Note } from '../core/notes';
 import { scanBlender } from '../core/blender';
+import { ResourceEntry, ResourceFile, listResources } from '../core/resources';
 import { Studio } from './studio';
 
 export type ProjectNode =
   | { kind: 'dashboard' }
+  | { kind: 'resources' }
+  | { kind: 'resGroup'; group: string; entries: ResourceEntry[] }
+  | { kind: 'resDir'; entry: ResourceEntry }
+  | { kind: 'resFile'; file: ResourceFile }
   | { kind: 'project' }
   | { kind: 'episode'; ep: Episode }
   | { kind: 'blender'; ep: Episode }
@@ -41,7 +46,12 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
   getChildren(n?: ProjectNode): ProjectNode[] {
     const model = this.studio.model;
     if (!model) return [];
-    if (!n) return [{ kind: 'dashboard' }, { kind: 'project' }, ...model.episodes.map((ep) => ({ kind: 'episode' as const, ep }))];
+    if (!n) return [{ kind: 'dashboard' }, { kind: 'resources' }, { kind: 'project' }, ...model.episodes.map((ep) => ({ kind: 'episode' as const, ep }))];
+    if (n.kind === 'resources')
+      return listResources(model.config.root, model.config.project.resources).map((g) => ({ kind: 'resGroup' as const, group: g.group, entries: g.entries }));
+    if (n.kind === 'resGroup')
+      return n.entries.map((e) => (e.dir ? { kind: 'resDir' as const, entry: e } : { kind: 'resFile' as const, file: e.files[0] }));
+    if (n.kind === 'resDir') return n.entry.files.map((file) => ({ kind: 'resFile' as const, file }));
     if (n.kind === 'episode') {
       const segs = n.ep.segments.map((seg) => ({ kind: 'segment' as const, ep: n.ep, seg }));
       return n.ep.legacy ? segs : [{ kind: 'blender' as const, ep: n.ep }, ...segs];
@@ -55,13 +65,47 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
     const C = vscode.TreeItemCollapsibleState;
     switch (n.kind) {
       case 'dashboard': {
-        const it = new vscode.TreeItem('Tổng quan dự án', C.None);
+        const it = new vscode.TreeItem('Trạng thái dự án', C.None);
         it.iconPath = new vscode.ThemeIcon('dashboard');
         it.command = { command: 'aiFilmStudio.openDashboard', title: '' };
         return it;
       }
+      case 'resources': {
+        const it = new vscode.TreeItem('Tài nguyên dự án', C.Collapsed);
+        it.iconPath = new vscode.ThemeIcon('library');
+        it.description = 'sử liệu · quy trình · kiến thức';
+        it.tooltip = 'Tài liệu dùng chung cả dự án — cấu hình ở .studio/project.yaml (resources)';
+        return it;
+      }
+      case 'resGroup': {
+        const it = new vscode.TreeItem(n.group, C.Collapsed);
+        it.iconPath = new vscode.ThemeIcon('folder-library');
+        it.description = `${n.entries.reduce((a, e) => a + e.files.length, 0)} file`;
+        return it;
+      }
+      case 'resDir': {
+        const it = new vscode.TreeItem(n.entry.label, n.entry.files.length ? C.Collapsed : C.None);
+        it.iconPath = vscode.ThemeIcon.Folder;
+        it.description = n.entry.files.length ? `${n.entry.files.length} file` : 'trống';
+        it.tooltip = n.entry.dir;
+        return it;
+      }
+      case 'resFile': {
+        const f = n.file;
+        const it = new vscode.TreeItem(f.label, C.None);
+        it.iconPath = new vscode.ThemeIcon(f.exists ? 'book' : 'warning');
+        it.description = f.exists ? '' : 'chưa có file';
+        it.tooltip = f.rel;
+        it.contextValue = 'resource';
+        if (f.exists) {
+          it.resourceUri = vscode.Uri.file(f.abs);
+          it.command = { command: 'markdown.showPreview', title: '', arguments: [vscode.Uri.file(f.abs)] };
+        }
+        return it;
+      }
       case 'project': {
-        const it = new vscode.TreeItem('Cả dự án (① ý tưởng · ② chia tập)', C.None);
+        const it = new vscode.TreeItem('Ý tưởng – phong cách', C.None);
+        it.description = '① ý tưởng · ② tóm tắt + chia tập';
         it.iconPath = new vscode.ThemeIcon('book');
         it.contextValue = 'project';
         it.command = { command: 'aiFilmStudio.openTarget', title: '', arguments: [n] };
@@ -70,10 +114,13 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
       case 'episode': {
         const ep = n.ep;
         const live = ep.segments.filter((s) => !s.dropped);
-        const it = new vscode.TreeItem(`${ep.id} ${ep.slug.replace(/-/g, ' ')}`, live.length || !ep.legacy ? C.Collapsed : C.None);
-        it.description = ep.legacy
-          ? 'cấu trúc cũ'
-          : `${live.length} đoạn · ${live.reduce((a, s) => a + s.scenes.length, 0)} cảnh · ${formatDuration(ep.sceneSeconds)}`;
+        const it = new vscode.TreeItem(episodeLabel(ep), live.length || !ep.legacy ? C.Collapsed : C.None);
+        const tag = ep.release ? ep.id : '';
+        it.description = ep.dropped
+          ? `${ep.id} · bỏ`
+          : ep.legacy
+          ? `${tag} cấu trúc cũ`.trim()
+          : `${tag ? tag + ' · ' : ''}${live.length} đoạn · ${live.reduce((a, s) => a + s.scenes.length, 0)} cảnh · ${formatDuration(ep.sceneSeconds)}`;
         it.iconPath = new vscode.ThemeIcon(ep.legacy ? 'archive' : 'device-camera-video');
         it.contextValue = 'episode';
         it.tooltip = `${ep.relDir}${ep.releaseDate ? `\nPhát hành: ${ep.releaseDate.toLocaleDateString('vi-VN')}` : ''}`;

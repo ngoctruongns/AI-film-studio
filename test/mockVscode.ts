@@ -4,6 +4,7 @@ import * as path from 'path';
 import { JSDOM, VirtualConsole } from 'jsdom';
 
 export const log: string[] = [];
+export const clipboard: { text?: string } = {};
 export const errors: string[] = [];
 /** Câu trả lời xếp hàng cho các hộp thoại: showInformationMessage/Warning (modal), showQuickPick, showInputBox, showOpenDialog */
 export const answers: { kind: string; value: any }[] = [];
@@ -268,7 +269,7 @@ export const languages = {
 };
 
 export const env = {
-  clipboard: { writeText: async (s: string) => log.push(`clipboard: ${s}`) },
+  clipboard: { writeText: async (s: string) => { clipboard.text = s; log.push(`clipboard: ${s}`); } },
   openExternal: async (u: Uri) => {
     log.push(`openExternal ${u.fsPath}`);
     return true;
@@ -277,8 +278,14 @@ export const env = {
 
 export function fakeContext(extensionPath: string) {
   const secrets = new Map<string, string>();
+  const gs = new Map<string, any>();
   return {
     subscriptions: [] as any[],
+    globalState: {
+      get: (k: string, d?: any) => (gs.has(k) ? gs.get(k) : d),
+      update: async (k: string, v: any) => void gs.set(k, v),
+      keys: () => [...gs.keys()],
+    },
     extensionPath,
     secrets: {
       get: async (k: string) => secrets.get(k),

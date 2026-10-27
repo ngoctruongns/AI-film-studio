@@ -4,6 +4,8 @@ import * as path from 'path';
 import { ProjectConfig, StatusKey, StudioConfig, parseStatus } from './config';
 import { columnIndex, findTable, isStruck, parseSeconds, parseTables, stripMd } from './markdown';
 import { SceneResult, parseResults } from './results';
+import { Attempt, parseAttempts } from './attempts';
+import { EpisodeRow, readEpisodeList } from './episodeList';
 
 export interface Scene {
   code: string;
@@ -36,6 +38,8 @@ export interface Segment {
   /** khóa file → đường dẫn tuyệt đối (chỉ file đang có) */
   files: Record<string, string>;
   scenes: Scene[];
+  /** sổ thử nghiệm: mọi dòng "Nhật ký lần sinh" trong các file .md của phân đoạn */
+  attempts: Attempt[];
   lineCodes: string[];
   readmeLine?: number;
 }
@@ -52,12 +56,20 @@ export interface Episode {
   legacy: boolean;
   plannedSeconds: number;
   sceneSeconds: number;
+  /** số phát hành (TAP01…) theo danh sách tập — chưa có nếu tập bỏ / chờ / chưa vào danh sách */
+  release?: string;
+  /** tên tập trong danh sách tập */
+  title?: string;
+  /** tập đã bỏ trong danh sách tập */
+  dropped?: boolean;
   releaseDate?: Date;
 }
 
 export interface ProjectModel {
   config: StudioConfig;
   episodes: Episode[];
+  /** các dòng của danh sách tập (gồm tập chưa có thư mục, tập bỏ) — theo thứ tự trong bảng */
+  episodeList: EpisodeRow[];
   mediaRoot?: string;
   mediaFound: boolean;
   scannedAt: Date;
@@ -83,7 +95,8 @@ export function placeholdersFor(model: ProjectModel, ep?: Episode, seg?: Segment
     episodeDir: ep?.relDir,
     segmentDir: seg?.relDir,
     ep: ep?.id,
-    T: ep ? `T${String(ep.num).padStart(2, '0')}` : undefined,
+    // {T} = số phát hành dạng T01 (khớp tiêu đề "## T01:" của khung tập); tập chưa có số phát hành thì theo mã sản xuất
+    T: ep ? `T${ep.release ? ep.release.replace(/\D/g, '') : String(ep.num).padStart(2, '0')}` : undefined,
     X: seg?.code,
     scene: scene?.code,
   };
@@ -104,6 +117,15 @@ function readIf(file: string | undefined): string | undefined {
 function listDirs(dir: string): string[] {
   try {
     return fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+  } catch {
+    return [];
+  }
+}
+
+/** file .md trực tiếp trong thư mục (không đệ quy) */
+export function listMd(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isFile() && d.name.endsWith('.md')).map((d) => path.join(dir, d.name)).sort();
   } catch {
     return [];
   }
@@ -255,9 +277,17 @@ export function scanProject(config: StudioConfig, mediaRootOverride?: string): P
       const info = segInfo.get(code);
       const scenes = sceneText ? parseScenes(sceneText, sceneFile!, code, p) : [];
       const results = sfiles['ket-qua'] ? parseResults(readIf(sfiles['ket-qua']) ?? '') : undefined;
+      const attempts: Attempt[] = [];
+      for (const f of listMd(sdir)) {
+        const t = readIf(f);
+        if (t && t.includes('Dùng được')) attempts.push(...parseAttempts(t, f));
+      }
       for (const sc of scenes) {
         sc.media = media.get(`${id}_${sc.code}`) ?? {};
         sc.result = results?.get(sc.code);
+        // chưa ghi tổng ở sổ kết quả → đếm từ nhật ký lần sinh
+        const n = attempts.filter((a) => a.scene === sc.code).length;
+        if (n && sc.result?.attempts === undefined) sc.result = { scene: sc.code, chosen: '', model: '', note: '', updated: '', ...sc.result, attempts: n };
       }
       segments.push({
         code,
@@ -272,6 +302,7 @@ export function scanProject(config: StudioConfig, mediaRootOverride?: string): P
         dropped: info?.dropped ?? false,
         files: sfiles,
         scenes,
+        attempts,
         lineCodes: parseLineCodes(readIf(sfiles['loi']), p),
         readmeLine: info?.line,
       });
@@ -290,6 +321,7 @@ export function scanProject(config: StudioConfig, mediaRootOverride?: string): P
         dropped: info.dropped,
         files: {},
         scenes: [],
+        attempts: [],
         lineCodes: [],
         readmeLine: info.line,
       });
@@ -300,7 +332,7 @@ export function scanProject(config: StudioConfig, mediaRootOverride?: string): P
     const ep: Episode = {
       id,
       num,
-      slug: m[2],
+      slug: m[2] ?? '',
       dir,
       relDir: rel(root, dir),
       files,
@@ -309,15 +341,37 @@ export function scanProject(config: StudioConfig, mediaRootOverride?: string): P
       plannedSeconds: live.reduce((a, s) => a + (s.plannedSeconds ?? 0), 0),
       sceneSeconds: live.reduce((a, s) => a + s.scenes.filter((c) => c.status !== 'dropped').reduce((b, c) => b + (c.seconds ?? 0), 0), 0),
     };
-    if (p.release) {
-      const d = new Date(p.release.firstDate);
-      d.setDate(d.getDate() + (num - p.release.firstEpisode) * p.release.everyDays);
-      if (num >= p.release.firstEpisode) ep.releaseDate = d;
-    }
     episodes.push(ep);
   }
-  episodes.sort((a, b) => a.num - b.num);
-  return { config, episodes, mediaRoot, mediaFound, scannedAt: new Date() };
+
+  // Danh sách tập: số phát hành + thứ tự. Không có danh sách thì như cũ — số phát hành theo mã sản xuất.
+  const listText = p.episodeList ? readIf(path.join(root, p.episodeList.file)) : undefined;
+  const episodeList = listText && p.episodeList ? readEpisodeList(listText, p.episodeList) : [];
+  const byCode = new Map(episodeList.map((r) => [r.code, r]));
+  for (const ep of episodes) {
+    const r = byCode.get(ep.id);
+    let n: number | undefined = episodeList.length ? undefined : ep.num;
+    if (r) {
+      ep.title = r.name;
+      ep.dropped = r.dropped;
+      ep.release = r.unreleased ? undefined : r.release;
+      n = ep.release ? Number(ep.release.replace(/\D/g, '')) : undefined;
+    }
+    if (p.release && n !== undefined && n >= p.release.firstEpisode) {
+      const d = new Date(p.release.firstDate);
+      d.setDate(d.getDate() + (n - p.release.firstEpisode) * p.release.everyDays);
+      ep.releaseDate = d;
+    }
+  }
+  const pos = (e: Episode) => byCode.get(e.id)?.order ?? 10000 + e.num;
+  episodes.sort((a, b) => pos(a) - pos(b));
+  return { config, episodes, episodeList, mediaRoot, mediaFound, scannedAt: new Date() };
+}
+
+/** tên hiện trên GUI: "TAP05 Liều mình cứu chúa" (chưa có số phát hành thì mã EP) */
+export function episodeLabel(ep: Episode, sep = ' '): string {
+  const name = ep.title || ep.slug.replace(/-/g, ' ');
+  return `${ep.release ?? ep.id}${name ? sep + name : ''}`;
 }
 
 export function findEpisode(model: ProjectModel, id: string | undefined): Episode | undefined {
