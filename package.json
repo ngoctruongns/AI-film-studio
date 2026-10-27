@@ -369,7 +369,7 @@
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
     "test": "npm run compile && node out/test/smoke.js && node out/test/gui.js",
-    "package": "npx --yes @vscode/vsce@3 package --allow-missing-repository --skip-license"
+    "package": "node -e \"for (const f of require('fs').readdirSync('.')) if (f.endsWith('.vsix')) require('fs').unlinkSync(f)\" && npx --yes @vscode/vsce@3 package --allow-missing-repository --skip-license"
   },
   "dependencies": {
     "yaml": "^2.5.0"

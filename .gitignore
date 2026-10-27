@@ -1,4 +1,4 @@
 node_modules/
 out/
-*.vsix
+# *.vsix vào git — máy khác clone về cài luôn, không build; npm run package xóa bản cũ, chỉ giữ bản mới nhất
 .vscode-test/

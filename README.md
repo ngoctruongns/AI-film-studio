@@ -108,13 +108,13 @@ Rồi **Ctrl+Shift+P → Developer: Reload Window**.
 4. Bảng **Gán model cho từng bước**: cột *Máy này* để dùng model local / rẻ riêng trên laptop mà không đổi cấu hình chung của dự án.
 
 ### Cập nhật khi có bản mới
+Repo có sẵn file **`.vsix` bản mới nhất** (một file duy nhất) — không cần build:
 ```bash
 cd <repo phim>/04_PRODUCTION/tools/studio
 git pull
-npm install
-npm run package
 code --install-extension ai-film-studio-<phiên bản>.vsix --force
 ```
+Sửa mã rồi tự build: `npm install` → `npm run package` (xóa `.vsix` cũ, tạo bản mới) → cài như trên.
 → **Developer: Reload Window**. Cài đặt, model, khóa API giữ nguyên.
 
 ### Gỡ
