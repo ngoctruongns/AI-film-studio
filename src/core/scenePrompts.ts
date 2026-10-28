@@ -32,7 +32,9 @@ export interface ScenePrompts {
   refs: SharedRef[];
 }
 
-const REF_RE = /@\[([A-Z0-9_]+)\]/g;
+/** ảnh dùng chung: `@[TÊN]` (danh bạ) hoặc tên file `EP01_REF_TÊN` (thẻ trong prompt, 28/10/2026) */
+const REF_RE = /@\[([A-Z0-9_]+)\]|(?<![A-Za-z0-9_])EP\d+_REF_([A-Z0-9_]+)/g;
+const refName = (m: RegExpMatchArray) => m[1] ?? m[2];
 const read = (f: string) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '');
 
 /** mục có tiêu đề BẮT ĐẦU bằng mã cảnh (không lấy nhầm "F02-F06" trong tiêu đề F02) */
@@ -94,7 +96,7 @@ export function scenePrompts(root: string, ep: Episode, segCode: string, scene: 
       if (sec) sections.push({ code: c.code, text: sec.text });
     }
   }
-  const names = [...new Set([...own.text.matchAll(REF_RE)].map((m) => m[1]))];
+  const names = [...new Set([...own.text.matchAll(REF_RE)].map(refName))];
   for (const name of names) {
     const al = aliases(name, prefixes);
     let prompt: SharedRef['prompt'];
@@ -106,7 +108,7 @@ export function scenePrompts(root: string, ep: Episode, segCode: string, scene: 
         break;
       }
     }
-    const usedIn = sections.filter((x) => x.code !== scene && al.some((a) => x.text.includes(`@[${a}]`))).map((x) => x.code);
+    const usedIn = sections.filter((x) => x.code !== scene && al.some((a) => x.text.includes(`@[${a}]`) || new RegExp(`_REF_${a}(?![A-Z0-9_])`).test(x.text))).map((x) => x.code);
     result.refs.push({ name, prompt, usedIn });
   }
   return result;

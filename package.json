@@ -2,7 +2,7 @@
   "name": "ai-film-studio",
   "displayName": "AI Film Studio",
   "description": "Quản lý pipeline làm phim AI: kịch bản → phân đoạn → cảnh → hồ sơ cảnh → prompt ảnh/video. Mỗi việc một tab, chọn model AI cho từng bước, dashboard tiến độ.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "ngoctruongns",
   "license": "UNLICENSED",
   "repository": {

@@ -508,6 +508,7 @@ async function main() {
   await kt.settle();
   await waitFor(() => /\[K\]/.test((kt.$('#secText') as HTMLTextAreaElement)?.value ?? ''), `⑤ hiện mục [K] của kịch bản: ${kt.$$('#stepper .st').map((x) => x.textContent).join(' → ')}`);
   ok(kt.$('#gridHost')!.hidden, '⑤ chưa hiện lưới');
+  ok(kt.$('#secNote') && !/### Ghi chú/.test((kt.$('#secText') as HTMLTextAreaElement).value), `⑤ ô Ghi chú riêng: "${((kt.$('#secNote') as HTMLTextAreaElement)?.value ?? '').slice(0, 40)}"`);
   (kt.$('#secText') as HTMLTextAreaElement).value += '\n- ý mới của phân đoạn K';
   (kt.$('#secNext') as HTMLElement).click();
   await kt.settle(10);

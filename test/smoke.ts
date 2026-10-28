@@ -12,6 +12,7 @@ import { formatDuration } from '../src/core/markdown';
 import { nextEpisodeCode, numberReleases, slugify } from '../src/core/episodeList';
 import { readIdea, writeIdea } from '../src/core/idea';
 import { isResource, listResources } from '../src/core/resources';
+import { lockedRows, protectSections, protectTable } from '../src/core/protect';
 
 const root = path.resolve(process.argv[2] ?? path.join(__dirname, '../../../../..'));
 const cfg = loadStudioConfig(root);
@@ -86,16 +87,48 @@ import { appendAttempt, attemptStats, parseAttempts } from '../src/core/attempts
     'Trương Phụ giơ gươm hô: {Hai quả cũng chém! 3 giây!}',
     'Ràng buộc: 1. Không chữ.',
     '```',
+    '## F97 · đúng — thẻ @ = tên file đầy đủ (28/10/2026)',
+    '**Nạp ảnh:** `EP01_F_B1_clay_2x2` · `EP01_REF_DC_LINH_MINH`',
+    '**Nạp:** `EP01_F97_R1_I0` · `EP01_F97_R1_I9` · `EP01_REF_TRUONGPHU_GOC` · *(tùy chọn `EP01_F97_R1.mp4` — xe lăn thật)*',
+    '```',
+    'Thực hiện video lần lượt theo các cảnh sau. Bố trí: viên tướng Minh giữa khung, người như @EP01_REF_TRUONGPHU_GOC, là Trương Phụ.',
+    '【Cảnh 1】 như @EP01_F97_R1_I0 · trung cảnh · đứng yên, lấy nhịp từ @EP01_F97_R1',
+    'Trương Phụ giơ gươm.',
+    '【Cảnh 2】 như @EP01_F97_R1_I9 · trung cảnh',
+    'Ràng buộc: 1. Không chữ.',
+    '```',
+    '## F96 · đúng — prompt tiếng Anh (D-28)',
+    '**Nạp:** `EP01_F96_R1_I0` · `EP01_F96_R1_I9` · `EP01_REF_TRUONGPHU_GOC`',
+    '```',
+    '@EP01_F96_R1_I0 is the first frame and @EP01_F96_R1_I9 is the final state. Generate the video shot by shot: dawn on a riverbank.',
+    'Layout: a Ming general at the center, built like @EP01_REF_TRUONGPHU_GOC, is Trương Phụ (张辅).',
+    '[Shot 1] as @EP01_F96_R1_I0 · medium shot · the camera holds still',
+    'Trương Phụ raises his sword and shouts: {Ai rút lui — chém!} (speaks Vietnamese)',
+    '[Shot 2] as @EP01_F96_R1_I9 · wide shot',
+    'Constraints: 1. No subtitles.',
+    '```',
+    '## F95 · sai — tiếng Anh',
+    '**Nạp:** `EP01_F95_R1_I0`',
+    '```',
+    'Generate the video shot by shot.',
+    '[Shot 1] as @EP01_F95_R1_I0 · the camera pans then push in',
+    'At 2 s four cannonballs fall, @EP01_F95_R1_I7 burns.',
+    '```',
   ].join('\n');
-  const cfgL = { maxRefs: 5, multiViewRef: '@\\[DC_', names: ['Trương Phụ'], cameraMoves: ['lùi', 'nâng'], countNouns: ['quả'] };
+  const cfgL = { maxRefs: 5, multiViewRef: '(@\\[|_REF_)DC_', names: ['Trương Phụ'], cameraMoves: ['lùi', 'nâng', 'pans', 'push in'], countNouns: ['quả', 'cannonballs'] };
   const got = lintPromptText(bad, cfgL);
   const rules = (from: number, to: number) => [...new Set(got.filter((g) => g.line >= from && g.line <= to).map((g) => g.rule))].sort();
   const want = ['P1', 'P10', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P9'];
   const f99 = rules(0, 8);
-  const f98 = rules(9, 99);
-  console.log(`\nSoát prompt: F99 (sai) → ${f99.join(',')} ${JSON.stringify(f99) === JSON.stringify(want) ? '✓' : '✗ thiếu ' + want.filter((w) => !f99.includes(w))}`);
-  console.log(`Soát prompt: F98 (đúng — tên khai báo xuống dòng, số trong thoại) → ${f98.length ? '✗ ' + got.filter((g) => g.line >= 9).map((g) => g.message).join(' | ') : '✓ không báo'}`);
-  if (JSON.stringify(f99) !== JSON.stringify(want) || f98.length) process.exitCode = 1;
+    console.log(`\nSoát prompt: F99 (sai) → ${f99.join(',')} ${JSON.stringify(f99) === JSON.stringify(want) ? '✓' : '✗ thiếu ' + want.filter((w) => !f99.includes(w))}`);
+  const lines = bad.split('\n');
+  const at = (h: string) => lines.findIndex((l) => l.startsWith(h));
+  const okRange = rules(9, at('## F95') - 1);
+  const f95 = rules(at('## F95'), 999);
+  console.log(`Soát prompt: F98 / F97 / F96 (đúng — tên khai báo, thẻ tên file, tiếng Anh) → ${okRange.length ? '✗ ' + got.filter((g) => g.line >= 9 && g.line < at('## F95')).map((g) => g.message).join(' | ') : '✓ không báo'}`);
+  const want95 = ['P10', 'P2', 'P4', 'P6', 'P9'];
+  console.log(`Soát prompt: F95 (sai, tiếng Anh) → ${f95.join(',')} ${JSON.stringify(f95) === JSON.stringify(want95) ? '✓' : '✗ cần ' + want95}`);
+  if (JSON.stringify(f99) !== JSON.stringify(want) || okRange.length || JSON.stringify(f95) !== JSON.stringify(want95)) process.exitCode = 1;
 
   // sổ thử nghiệm
   const crit = ['dáng', 'đạn', 'thứ tự'];
@@ -136,4 +169,18 @@ import { appendAttempt, attemptStats, parseAttempts } from '../src/core/attempts
   const okRes = isResource('01_RESEARCH/65_ngon-ngu-dien-anh/01_ke-bang-hinh-va-loi-dan.md', cfg.project.resources) && !isResource('04_PRODUCTION/EPISODES/EP01/README.md', cfg.project.resources);
   console.log(`Tài nguyên dự án: ${res.length} nhóm · ${nRes} file${missing.length ? ' · thiếu ' + missing.join(', ') : ''} ${okRes ? '✓' : '✗'}`);
   if (!okRes) process.exitCode = 1;
+
+  // chỉ tạo lại cái chưa duyệt — tool khôi phục phần đã duyệt
+  const tOrig = ['| Mã | Giây | Hình | Trạng thái |', '|---|---|---|---|', '| **K01** | 5 | gốc 1 | ✅ |', '| **K02** | 6 | gốc 2 | ⬜ |', '| **K03** | 4 | gốc 3 | ✅ |'].join('\n');
+  const tProp = ['| Mã | Giây | Hình | Trạng thái |', '|---|---|---|---|', '| **K01** | 9 | AI sửa | ⬜ |', '| **K02** | 7 | AI mới 2 | ⬜ |', '| **K04** | 3 | AI thêm | ⬜ |'].join('\n');
+  const tp = { codeColumn: 'Mã', codeRe: /^K\d{2}$/, statusColumn: 'Trạng thái', lockSymbols: ['✅'] };
+  const lk = lockedRows(tOrig, tp);
+  const pt = protectTable(tOrig, tProp, tp, lk);
+  const okT = lk.join() === 'K01,K03' && pt.text.includes('| **K01** | 5 | gốc 1 | ✅ |') && pt.text.includes('| **K03** | 4 | gốc 3 | ✅ |') && pt.text.includes('AI mới 2') && pt.restored.join() === 'K01,K03';
+  const sOrig = '# KB\n\n## [A] MỞ\ngốc A\n### Ghi chú [A]\nok\n\n## [B] HAI\ngốc B\n';
+  const sProp = '# KB\n\n## [A] MỞ\nAI viết lại A\n\n## [B] HAI\nAI viết lại B\n\n## [C] MỚI\nAI thêm C\n';
+  const ps = protectSections(sOrig, sProp, ['A']);
+  const okS = ps.text.includes('gốc A\n### Ghi chú [A]\nok') && ps.text.includes('AI viết lại B') && ps.text.includes('AI thêm C') && !ps.text.includes('AI viết lại A');
+  console.log(`Giữ phần đã duyệt: bảng ${pt.restored.join(',')} ${okT ? '✓' : '✗ ' + pt.text} · mục ## [A] ${okS ? '✓' : '✗ ' + ps.text}`);
+  if (!okT || !okS) process.exitCode = 1;
 }

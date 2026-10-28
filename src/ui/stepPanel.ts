@@ -15,6 +15,8 @@ import { episodeLabel, fill, findEpisode, findScene, findSegment } from '../core
 import { readIdea, writeIdea } from '../core/idea';
 import { isResource } from '../core/resources';
 import { scenePrompts } from '../core/scenePrompts';
+import { TableProtect, lockedRows, protectSections, protectTable } from '../core/protect';
+import { EPISODE_CODE_RE } from '../core/episodeList';
 import { mergeSegmentTable, setSegmentStatus } from '../core/segmentTable';
 import { slugify } from '../core/episodeList';
 import { createSegmentDir } from './commands';
@@ -497,6 +499,8 @@ export class StepPanel {
     const rs = this.resolve();
     const main = this.model();
     if (!rs || !main) return;
+    const lk = this.lock(rs);
+    if (lk.blocked) return void vscode.window.showWarningMessage(lk.blocked);
     if (!rs.gate.ok && !skipGate) {
       vscode.window.showWarningMessage(`Cổng chưa mở: ${rs.gate.reasons.join('; ')}`);
       return;
@@ -523,7 +527,9 @@ export class StepPanel {
 
   private async runOne(rs: ResolvedStep, m: ModelConfig): Promise<void> {
     const provider = this.models.provider(m);
-    const bp = buildPrompt(this.studio.model!, rs, this.request, provider.loadsProjectInstructions);
+    const lk = this.lock(rs);
+    const request = lk.codes.length ? `${this.request}\n\n⭐ ĐÃ DUYỆT — giữ NGUYÊN VĂN, không viết lại (tool sẽ tự khôi phục): ${lk.codes.join(', ')}. Chỉ tạo lại các mục chưa duyệt, theo ghi chú của chúng.`.trim() : this.request;
+    const bp = buildPrompt(this.studio.model!, rs, request, provider.loadsProjectInstructions);
     const apiKey = await this.models.apiKey(m);
     if (provider.needsKey && !apiKey) {
       vscode.window.showErrorMessage(`Model ${m.id} cần khóa API — mở Cài đặt AI để dán khóa.`);
@@ -558,7 +564,12 @@ export class StepPanel {
         costReported: res.costReported,
       });
       const files: Record<string, string> = { 'answer.md': res.text };
-      if (rs.output) files['proposal.md'] = mergeOutput(this.resolve() ?? rs, extractOutput(res.text));
+      if (rs.output) {
+        const merged = mergeOutput(this.resolve() ?? rs, extractOutput(res.text));
+        const pr = lk.apply(merged);
+        files['proposal.md'] = pr.text;
+        if (pr.restored.length) vscode.window.showInformationMessage(`AI sửa vào phần đã duyệt — tool khôi phục nguyên văn: ${pr.restored.join(', ')}.`);
+      }
       writeRun(root, rec, files);
       this.post();
       // chạy một model: mở diff ngay · so sánh: người bấm "Xem diff" từng bản
@@ -684,6 +695,39 @@ export class StepPanel {
     const term = vscode.window.createTerminal({ name: `Script · ${s.label}`, cwd: this.studio.root });
     term.show();
     term.sendText(fill(s.command, rs.ph));
+  }
+
+  // ------------------------------------------------------------------ chỉ tạo lại cái chưa duyệt
+  /** phần đã duyệt của bước này: mã bị khóa + hàm khôi phục bản đề xuất · blocked = cả bước khóa (đối tượng đã duyệt) */
+  private lock(rs: ResolvedStep): { codes: string[]; blocked?: string; apply: (proposed: string) => { text: string; restored: string[] } } {
+    const none = { codes: [] as string[], apply: (t: string) => ({ text: t, restored: [] as string[] }) };
+    const kind = rs.step.protect;
+    const model = this.studio.model;
+    if (!kind || !model) return none;
+    const p = model.config.project;
+    const { ep, seg, scene } = this.nodes();
+    // đã duyệt + đã bỏ (giữ dòng gạch) đều khóa
+    const done = [...(p.status.done ?? ['✅']), ...(p.status.dropped ?? [])];
+    if (kind === 'segment' && seg?.status === 'done') return { ...none, blocked: `Phân đoạn ${seg.code} đã duyệt — bỏ duyệt ở tab tập ④ trước khi cho AI viết lại.` };
+    if (kind === 'scene' && scene?.status === 'done') return { ...none, blocked: `Cảnh ${scene.code} đã duyệt — bỏ duyệt trước khi cho AI viết lại.` };
+    if (kind === 'segment' || kind === 'scene') return none;
+    const original = rs.output?.exists ? fs.readFileSync(rs.output.abs, 'utf8') : '';
+    if (!original) return none;
+    if (kind === 'segments') {
+      const codes = (ep?.segments ?? []).filter((x) => x.status === 'done' || x.dropped).map((x) => x.code);
+      return { codes, apply: (t) => protectSections(original, t, codes) };
+    }
+    let t: TableProtect | undefined;
+    if (kind === 'scenes') t = { codeColumn: p.sceneTable.codeColumn, codeRe: new RegExp(p.codes.scene), statusColumn: p.sceneTable.statusColumn, lockSymbols: done };
+    if (kind === 'lines') {
+      const L = p.linesTable ?? { codeColumn: 'Mã', statusColumn: 'Trạng thái' };
+      t = { codeColumn: L.codeColumn, codeRe: new RegExp(`^${p.codes.line}$`), statusColumn: L.statusColumn, lockSymbols: [...done, '✍'] };
+    }
+    if (kind === 'episodes' && p.episodeList) t = { codeColumn: p.episodeList.codeColumn, codeRe: EPISODE_CODE_RE, statusColumn: p.episodeList.statusColumn, lockSymbols: done };
+    if (!t) return none;
+    const tt = t;
+    const codes = lockedRows(original, tt);
+    return { codes, apply: (x) => protectTable(original, x, tt, codes) };
   }
 
   // ------------------------------------------------------------------ form ① ý tưởng + phong cách · ② kịch bản tóm tắt + danh sách tập
@@ -1143,9 +1187,12 @@ function renderEditor(ed) {
     return;
   }
   if (ed.kind === 'section') {
+    window._secOrig = ed.text;
     $('editor').innerHTML = '<h2>Kịch bản của phân đoạn <span class="muted">' + (ed.file ? 'mục trong <a data-open="' + esc(ed.file) + '" data-line="' + ed.line + '">' + esc(ed.file) + '</a>' : '') + (ed.found ? '' : ' · chưa có mục này — lưu là thêm vào cuối file') + '</span></h2>'
       + '<p class="muted">Xác định nội dung chính của phân đoạn (ý đồ · cảnh trí · hành động · sử liệu · thời lượng). Lưu là ghi lại đúng mục này trong kịch bản chi tiết của tập.</p>'
-      + '<textarea id="secText" style="min-height:320px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+      + '<textarea id="secText" style="min-height:300px;font-family:var(--vscode-editor-font-family)">' + esc(splitNote(ed.text).body) + '</textarea>'
+      + '<h3 style="margin:10px 0 4px">Ghi chú của phân đoạn <span class="muted">— ý sửa cho AI; bấm Tạo phân cảnh / Tạo phân đoạn là AI làm theo ghi chú (chỉ phần chưa duyệt)</span></h3>'
+      + '<textarea id="secNote" style="min-height:110px;font-family:var(--vscode-editor-font-family)" placeholder="vd. thêm cảnh … · bỏ … · rút ngắn …">' + esc(splitNote(ed.text).note) + '</textarea>'
       + '<div class="row" style="margin-top:6px"><button class="sec" id="saveSec">Lưu kịch bản phân đoạn</button>' + dirtyMark
       + (ed.next ? '<button id="secNext" title="lưu → sang bước sau → AI chạy luôn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu → sang ⑥ → AI chia cảnh (xem diff rồi Nhận, lưới cập nhật)</span>' : '') + '</div>';
     return;
@@ -1188,6 +1235,16 @@ function renderEditor(ed) {
     + '<div id="epList">' + epTable(ed) + '</div>';
 }
 // markdown gọn: khối code (ba dấu huyền) thành <pre> có nút 📋 chép, chữ thường giữ đậm / code
+// mục "### Ghi chú [X]" ở cuối phân đoạn ↔ ô Ghi chú riêng
+function splitNote(t) {
+  const m = /\\n### Ghi chú[^\\n]*\\n/.exec(String(t));
+  if (!m) return { body: String(t).replace(/\\s+$/, ''), note: '', head: null };
+  return { body: String(t).slice(0, m.index).replace(/\\s+$/, ''), note: String(t).slice(m.index + m[0].length).trim(), head: m[0].trim() };
+}
+function joinNote(body, note, code, head) {
+  const n = String(note).trim();
+  return String(body).replace(/\\s+$/, '') + (n || head ? '\\n\\n' + (head || '### Ghi chú [' + code + ']') + '\\n\\n' + n : '') + '\\n';
+}
 function inlineMd(t) { return esc(t).replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>').replace(/\\x60([^\\x60]+)\\x60/g, '<code>$1</code>'); }
 let copyN = 0; const copyText = {};
 function mdBlocks(text, label) {
@@ -1224,7 +1281,7 @@ function epTable(ed) {
     + (e.dir ? '<a data-cmd="target" data-arg="' + esc(JSON.stringify({ ep: e.code })) + '">mở</a>' : '<span class="muted">chưa có</span>') + '</td></tr>').join('') + '</table>';
 }
 document.addEventListener('input', (e) => {
-  if (e.target.closest('#editor') && (e.target.matches('.ideaF, .ideaO, #synText, #olText, #secText'))) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
+  if (e.target.closest('#editor') && (e.target.matches('.ideaF, .ideaO, #synText, #olText, #secText, #secNote'))) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
 });
 document.addEventListener('change', (e) => {
   if (e.target.matches && e.target.matches('select.ideaF, select.segSt')) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
@@ -1239,7 +1296,11 @@ document.addEventListener('click', (e) => {
     edDirty = false; edKey = null;
     vscode.postMessage({ type: 'saveIdea', values: values, byIndex: true });
   }
-  if (e.target.id === 'saveSec' || e.target.id === 'secNext') { edDirty = false; edKey = null; vscode.postMessage({ type: 'saveSection', text: $('secText').value, next: e.target.id === 'secNext' }); }
+  if (e.target.id === 'saveSec' || e.target.id === 'secNext') {
+    const head = splitNote(window._secOrig || '').head, code = ((window._secOrig || '').match(/\\[([A-Z])\\]/) || [])[1] || '';
+    edDirty = false; edKey = null;
+    vscode.postMessage({ type: 'saveSection', text: joinNote($('secText').value, $('secNote').value, code, head), next: e.target.id === 'secNext' });
+  }
   if (e.target.id === 'saveOl' || e.target.id === 'olNext') { edDirty = false; edKey = null; vscode.postMessage({ type: 'saveOutline', text: $('olText').value, next: e.target.id === 'olNext' }); }
   if (e.target.id === 'saveSeg') {
     const changes = {};

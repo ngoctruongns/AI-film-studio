@@ -155,6 +155,9 @@ export interface StepSpec {
   view?: ('media' | 'grid' | 'lines' | 'idea' | 'synopsis' | 'outline' | 'segments' | 'section' | 'prompts' | 'render')[];
   /** nút chuyển sang bước sau và chạy AI luôn, vd. ③ Dàn ý → "Tạo phân đoạn" → ④ */
   next?: { step: string; label: string };
+  /** AI chỉ tạo lại cái CHƯA duyệt: sau khi AI trả bản đề xuất, tool khôi phục nguyên văn phần đã duyệt (core/protect.ts).
+   *  scenes / lines / episodes = dòng bảng · segments = mục ## [X] · segment / scene = cả bước khóa khi đối tượng đã duyệt */
+  protect?: 'scenes' | 'lines' | 'episodes' | 'segments' | 'segment' | 'scene';
   /** chữ trên nút chạy AI (mặc định "Chạy"), vd. "Chia tập" */
   runLabel?: string;
   gate?: StepGate;
