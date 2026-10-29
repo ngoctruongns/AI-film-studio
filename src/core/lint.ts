@@ -4,6 +4,7 @@ import { columnIndex, formatDuration, parseTables } from './markdown';
 import { scanBlender } from './blender';
 import { ProjectModel, listMd } from './scanner';
 import { lintPromptText } from './promptLint';
+import { episodeDuration } from './idea';
 
 export interface Issue {
   file: string;
@@ -30,9 +31,15 @@ export function lintProject(model: ProjectModel): Issue[] {
 
   for (const ep of model.episodes) {
     if (ep.legacy) continue;
-    const cap = p.episodeCapSeconds;
-    if (cap && ep.sceneSeconds > cap && ep.files['readme']) {
-      issues.push({ file: ep.files['readme'], line: 0, severity: 'warning', message: `${ep.id}: tổng giây các cảnh ${formatDuration(ep.sceneSeconds)} vượt trần ${formatDuration(cap)}` });
+    // khung thời lượng tập: ô "Thời lượng mỗi tập" của form ① (dự phòng: episodeCapSeconds)
+    const dur = episodeDuration(model.config.root, p.idea, p.episodeCapSeconds);
+    if (dur.max && ep.sceneSeconds > dur.max && ep.files['readme']) {
+      issues.push({ file: ep.files['readme'], line: 0, severity: 'warning', message: `${ep.id}: tổng giây các cảnh ${formatDuration(ep.sceneSeconds)} vượt trần ${formatDuration(dur.max)}${dur.text ? ` (khung ${dur.text})` : ''}` });
+    }
+    // thiếu: chỉ báo khi mọi phân đoạn đã chia cảnh (đang làm dở thì tổng còn thấp là thường)
+    const live = ep.segments.filter((s) => !s.dropped);
+    if (dur.min && live.length && live.every((s) => s.scenes.length) && ep.sceneSeconds < dur.min && ep.files['readme']) {
+      issues.push({ file: ep.files['readme'], line: 0, severity: 'warning', message: `${ep.id}: tổng giây các cảnh ${formatDuration(ep.sceneSeconds)} dưới khung ${dur.text} (tối thiểu ${formatDuration(dur.min)})` });
     }
 
     // Danh bạ @[TÊN] của tập

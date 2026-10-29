@@ -10,7 +10,7 @@ import { buildPrompt, resolveStep } from '../src/core/context';
 import { applyManagedBlock } from '../src/core/gitignore';
 import { formatDuration } from '../src/core/markdown';
 import { nextEpisodeCode, numberReleases, slugify } from '../src/core/episodeList';
-import { readIdea, writeIdea } from '../src/core/idea';
+import { episodeDuration, parseDuration, readIdea, writeIdea } from '../src/core/idea';
 import { isResource, listResources } from '../src/core/resources';
 import { lockedRows, protectSections, protectTable } from '../src/core/protect';
 
@@ -161,6 +161,13 @@ import { appendAttempt, attemptStats, parseAttempts } from '../src/core/attempts
   const okIdea = iv['Ý tưởng chính'] === 'Mới' && iv['Thể loại'] === 'Hoạt hình' && iv['Mục riêng'] === 'giữ' && itext.startsWith('# X');
   console.log(`Form ý tưởng: ${okIdea ? '✓' : '✗ ' + JSON.stringify(iv)}`);
   if (!okIdea) process.exitCode = 1;
+
+  // thời lượng mỗi tập (ô thoiLuong của form ①)
+  const pd = [parseDuration('15–20 phút'), parseDuration('20-15′'), parseDuration('45 phút'), parseDuration('1 giờ'), parseDuration('')];
+  const ed = episodeDuration(root, cfg.project.idea, cfg.project.episodeCapSeconds);
+  const okDur = pd[0].min === 900 && pd[0].max === 1200 && pd[1].min === 900 && pd[2].max === 2700 && pd[2].min === undefined && pd[3].max === 3600 && pd[4].max === undefined && !!ed.max;
+  console.log(`Thời lượng tập: ${okDur ? '✓' : '✗ ' + JSON.stringify(pd)} · dự án "${ed.text}" → ${ed.min ?? '-'}–${ed.max} s`);
+  if (!okDur) process.exitCode = 1;
 
   // tài nguyên dự án
   const res = listResources(root, cfg.project.resources);

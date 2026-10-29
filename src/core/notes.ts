@@ -1,4 +1,6 @@
-// Gom ghi chú '@C:' (việc cho AI) và '@T:' (câu hỏi cho người) trong mọi file .md.
+// Gom ghi chú trong mọi file .md (quy ước 29/10/2026 — QUY-UOC-MA-SO.md §Ghi chú):
+//   /*@C … */  người dùng → AI (việc cần làm) · /*@T … */  AI → người dùng (câu hỏi, góp ý thêm / bớt / sửa) — một hay nhiều dòng
+//   dạng một dòng cũ '@C: …' / '@T: …' vẫn đọc · <!-- @tool … --> do tool ghi (trạng thái), không gom.
 import * as fs from 'fs';
 import * as path from 'path';
 import { ProjectConfig } from './config';
@@ -45,8 +47,15 @@ export function scanNotes(root: string, p: ProjectConfig): Note[] {
     } catch {
       continue;
     }
-    if (!text.includes(todo) && !text.includes(question)) continue;
+    if (!text.includes(todo) && !text.includes(question) && !text.includes('/*@')) continue;
+    // khối /*@C … */ · /*@T … */ (nhiều dòng được)
+    for (const m of text.matchAll(/\/\*@([CT])\b:?([\s\S]*?)\*\//g)) {
+      const line = text.slice(0, m.index).split(/\r?\n/).length - 1;
+      const body = m[2].replace(/[*`|]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+      notes.push({ kind: m[1] === 'C' ? 'todo' : 'question', file, line, text: body });
+    }
     text.split(/\r?\n/).forEach((l, i) => {
+      if (l.includes('/*@')) return;                   // đã tính ở khối trên
       // '✅ @C (ngày): đã làm …' là ghi chú đã xử lý — bỏ qua
       if (l.includes(todo) && !/✅\s*@C/.test(l)) notes.push({ kind: 'todo', file, line: i, text: snippet(l, todo) });
       if (l.includes(question)) notes.push({ kind: 'question', file, line: i, text: snippet(l, question) });

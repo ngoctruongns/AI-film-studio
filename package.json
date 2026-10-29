@@ -2,7 +2,7 @@
   "name": "ai-film-studio",
   "displayName": "AI Film Studio",
   "description": "Quản lý pipeline làm phim AI: kịch bản → phân đoạn → cảnh → hồ sơ cảnh → prompt ảnh/video. Mỗi việc một tab, chọn model AI cho từng bước, dashboard tiến độ.",
-  "version": "1.1.0",
+  "version": "1.7.0",
   "publisher": "ngoctruongns",
   "license": "UNLICENSED",
   "repository": {
@@ -138,12 +138,6 @@
         "icon": "$(table)"
       },
       {
-        "command": "aiFilmStudio.endSession",
-        "title": "Kết thúc phiên (nháp nhật ký STATE)",
-        "category": "AI Film Studio",
-        "icon": "$(debug-stop)"
-      },
-      {
         "command": "aiFilmStudio.openBlender",
         "title": "Blender của tập (file, shot, frame → cảnh)",
         "category": "AI Film Studio",
@@ -167,11 +161,6 @@
           "command": "aiFilmStudio.startWork",
           "when": "view == aiFilmStudio.project",
           "group": "navigation@2"
-        },
-        {
-          "command": "aiFilmStudio.endSession",
-          "when": "view == aiFilmStudio.project",
-          "group": "navigation@3"
         },
         {
           "command": "aiFilmStudio.openSettings",

@@ -1,4 +1,5 @@
 // Tab 🧊 Blender của một tập: file .blend · script dựng · hướng dẫn · shot (marker) → frame → cảnh · quét từ Blender · ghi sổ SO-BLENDER.md.
+import { CHAT_BODY, CHAT_JS, ChatController } from './chat';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -56,6 +57,7 @@ export class BlenderPanel {
   }
 
   private sub: vscode.Disposable;
+  private chat: ChatController;
 
   private constructor(
     readonly panel: vscode.WebviewPanel,
@@ -63,13 +65,27 @@ export class BlenderPanel {
     private epId: string,
   ) {
     this.sub = studio.onDidChange(() => this.post());
+    this.chat = new ChatController(studio, `blender·${epId}`, (m) => this.panel.webview.postMessage(m), () => {
+      const b = this.bm ?? (this.studio.model ? scanBlender(this.studio.model, this.ep()!) : undefined);
+      if (!b) return { label: `Blender ${epId}`, text: '' };
+      return {
+        label: `🧊 Blender của ${epId}`,
+        text: [
+          `- Tập ${epId} · trang Blender (file .blend, shot = marker, frame → cảnh)`,
+          `- Sổ: \`${this.studio.rel(b.registerFile)}\`${b.registerExists ? '' : ' (chưa ghi)'}`,
+          `- File .blend:\n${b.files.map((f) => `  - ${f.name}${f.rel ? ` (\`${f.rel}\`)` : ''}${f.present ? '' : ' — dựng tại máy, không có trong repo'}`).join('\n')}`,
+          `- Shot:\n${b.shots.map((s) => `  - ${s.code} · ${s.file} · camera ${s.camera ?? '?'} · frame ${s.start}–${s.end} · nguồn ${s.source}`).join('\n')}`,
+          b.issues.length ? `- Cảnh báo:\n${b.issues.map((i) => `  - ${i.message}`).join('\n')}` : '',
+        ].filter(Boolean).join('\n'),
+      };
+    });
     panel.webview.onDidReceiveMessage((m) =>
       this.onMessage(m).catch((e) => {
         this.status(`❌ ${e.message ?? e}`);
         vscode.window.showErrorMessage(String(e.message ?? e));
       }),
     );
-    panel.webview.html = shell(panel.webview, 'Blender', BODY, CLIENT_JS);
+    panel.webview.html = shell(panel.webview, 'Blender', BODY + CHAT_BODY, CLIENT_JS + CHAT_JS);
   }
 
   private ep(): Episode | undefined {
@@ -132,6 +148,7 @@ export class BlenderPanel {
   }
 
   private async onMessage(m: any): Promise<void> {
+    if (m.__chat) return this.chat.onMessage(m);
     const model = this.studio.model;
     switch (m.type) {
       case 'ready':

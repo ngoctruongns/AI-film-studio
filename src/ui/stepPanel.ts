@@ -1,3 +1,4 @@
+import { exec } from 'child_process';
 // Tab của một ĐỐI TƯỢNG (dự án / tập / phân đoạn / cảnh): trên cùng overview + sơ đồ các bước của cấp đó, bấm bước nào
 // thì nội dung bước đó hiện bên dưới (lần đầu: bước 1). Mỗi đối tượng một tab, mở lại thì nhảy về tab cũ.
 import * as fs from 'fs';
@@ -12,7 +13,8 @@ import { MediaFile, listSceneMedia, mediaTargetName, upsertResult } from '../cor
 import { Mark, appendAttempt, parseMark } from '../core/attempts';
 import { RunRecord, newRunId, readRuns, runPath, writeRun } from '../core/runs';
 import { episodeLabel, fill, findEpisode, findScene, findSegment } from '../core/scanner';
-import { readIdea, writeIdea } from '../core/idea';
+import { episodeDuration, readIdea, writeIdea } from '../core/idea';
+import { outlineStatus, stripOutlineStatus, withOutlineStatus } from '../core/outline';
 import { isResource } from '../core/resources';
 import { scenePrompts } from '../core/scenePrompts';
 import { TableProtect, lockedRows, protectSections, protectTable } from '../core/protect';
@@ -20,7 +22,8 @@ import { EPISODE_CODE_RE } from '../core/episodeList';
 import { mergeSegmentTable, setSegmentStatus } from '../core/segmentTable';
 import { slugify } from '../core/episodeList';
 import { createSegmentDir } from './commands';
-import { GRID_BODY, GridController, gridClientJs } from './gridPanel';
+import { GRID_BODY, GridController, finalizeCodes, finalizeEpisodeList, gridClientJs } from './gridPanel';
+import { CHAT_BODY, CHAT_JS, ChatController } from './chat';
 import { scanBlender } from '../core/blender';
 import { gotoShotInBlender } from './blenderPanel';
 import { ModelRegistry } from './models';
@@ -31,6 +34,8 @@ interface PanelState {
   /** bước đang hiện — trống thì lấy bước đầu của cấp */
   stepId?: string;
   target: StepTarget;
+  /** ③ Dàn ý ở cấp dự án: tập đang sửa */
+  olEp?: string;
 }
 
 export function scopeOf(t: StepTarget): Scope {
@@ -56,10 +61,14 @@ export class StepPanel {
   /** các lần chạy của tab này (mới nhất đầu) — chạy song song được để so sánh model */
   private runs: RunRecord[] = [];
   private aborts = new Map<string, AbortController>();
+  /** lần chạy cho đối tượng khác tab (③ Dàn ý ở tab dự án chạy cho từng tập) → bước + đối tượng của nó */
+  private runTargets = new Map<string, { step: StepSpec; target: StepTarget }>();
+  /** khung chat cuối trang */
+  private chat: ChatController;
   private shown?: number;
   /** lưới bảng cảnh nằm trong tab (bước ⑥ Phân cảnh) */
   private gridCtl?: GridController;
-  private gridKind?: 'scenes' | 'lines';
+  private gridKind?: 'scenes' | 'lines' | 'episodes';
   private readonly subs: vscode.Disposable[] = [];
 
   /** Mở tab của đối tượng; có stepId thì chọn luôn bước đó */
@@ -106,6 +115,7 @@ export class StepPanel {
   ) {
     const key = targetKey(state.target);
     StepPanel.panels.set(key, this);
+    this.chat = new ChatController(studio, key, (m) => this.panel.webview.postMessage(m), () => this.chatContext());
     if (!state.stepId || !this.steps().some((x) => x.id === state.stepId)) state.stepId = this.steps()[0]?.id;
     panel.webview.options = { enableScripts: true, localResourceRoots: StepPanel.roots(studio) };
     // đăng ký nhận tin TRƯỚC khi gán html — tin 'ready' của webview không bị lỡ
@@ -145,6 +155,12 @@ export class StepPanel {
     const step = this.studio.config?.pipeline.steps.find((s) => s.id === this.state.stepId);
     if (!step || !this.studio.model) return undefined;
     return resolveStep(this.studio.model, step, this.state.target);
+  }
+
+  /** bước + đối tượng của một lần chạy (mặc định: bước đang mở của tab) */
+  private rsOf(id: string): ResolvedStep | undefined {
+    const t = this.runTargets.get(id);
+    return t && this.studio.model ? resolveStep(this.studio.model, t.step, t.target) : this.resolve();
   }
 
   private model(): ModelConfig | undefined {
@@ -205,7 +221,8 @@ export class StepPanel {
       const segs = ep.segments.filter((x) => !x.dropped);
       const scenes = segs.flatMap((x) => x.scenes).filter((c) => c.status !== 'dropped');
       facts.push({ k: 'Phân đoạn', v: count(segs) }, { k: 'Cảnh', v: count(scenes) });
-      facts.push({ k: 'Giây cảnh', v: `${formatDuration(ep.sceneSeconds)}${model.config.project.episodeCapSeconds ? ` / trần ${formatDuration(model.config.project.episodeCapSeconds)}` : ''}` });
+      const dur = episodeDuration(model.config.root, model.config.project.idea, model.config.project.episodeCapSeconds);
+      facts.push({ k: 'Giây cảnh', v: `${formatDuration(ep.sceneSeconds)}${dur.text ? ` / khung ${dur.text}` : dur.max ? ` / trần ${formatDuration(dur.max)}` : ''}` });
       if (ep.releaseDate) facts.push({ k: 'Phát hành', v: ep.releaseDate.toLocaleDateString('vi-VN') });
       links.push({ cmd: 'openBlender', label: '🧊 Blender của tập' });
       if (ep.files['readme']) links.push({ cmd: 'openFile', arg: ep.files['readme'], label: 'README tập' });
@@ -243,6 +260,30 @@ export class StepPanel {
       else if (x.view?.includes('media')) state = scene?.result ? 'done' : 'todo';
       return { id: x.id, no: x.no, title: x.title, executor: x.executor, state, model: x.executor === 'chat' ? this.models.forStep(x.id)?.id : undefined };
     });
+  }
+
+  // ------------------------------------------------------------------ ngữ cảnh cho khung chat cuối trang
+  private chatContext(): { label: string; text: string } {
+    if (!this.studio.model) return { label: 'chưa nạp dự án', text: '' };
+    const o = this.overview();
+    const rs = this.resolve();
+    const out: string[] = [];
+    out.push(`- Đối tượng: ${o.crumbs.map((c) => c.label).join(' › ')} — **${o.title}**`);
+    if (o.facts.length) out.push(`- Số liệu: ${o.facts.map((f) => `${f.k}: ${f.v}`).join(' · ')}`);
+    const steps = this.steps();
+    if (steps.length) out.push(`- Các bước của cấp này: ${steps.map((x) => `${x.no} ${x.title}`).join(' → ')}`);
+    if (rs) {
+      out.push(`- Bước đang mở: **${rs.step.no} ${rs.step.title}** (${rs.step.executor === 'human' ? 'người làm' : rs.step.executor === 'chat' ? 'có nút AI' : 'agent'})${rs.step.description ? ` — ${rs.step.description}` : ''}`);
+      const files = [...rs.inputs, ...(rs.output ? [rs.output] : [])].filter((f) => f.rel && !f.virtual);
+      if (files.length) out.push(`- File liên quan:\n${files.map((f) => `  - \`${f.rel}\`${f.ref.select ? ` (${f.ref.select})` : ''} — ${f.role === 'output' ? 'đầu ra' : f.label}${f.exists ? '' : ' · chưa có'}`).join('\n')}`);
+      // nội dung đang mở: ô sửa của trang (dàn ý, kịch bản…) hoặc file đầu ra của bước
+      const ed: any = this.editorVm(rs.step.view ?? []);
+      const main = ed?.text ?? ed?.rows ?? (rs.output?.text || '');
+      const name = ed?.kind === 'outlines' ? `dàn ý ${ed.cur ?? ''} (${ed.file ?? ''})` : ed?.file ?? rs.output?.rel ?? '';
+      if (main) out.push(`\n### Nội dung đang mở — ${name}\n\n${main}`);
+      if (ed?.kind === 'outlines') out.push(`\n### Trạng thái dàn ý các tập\n${ed.rows.map((r: any) => `- ${r.code} ${r.release} ${r.name}: ${r.status}`).join('\n')}`);
+    }
+    return { label: `${o.title}${rs ? ` · ${rs.step.no} ${rs.step.title}` : ''}`, text: out.join('\n') };
   }
 
   // ------------------------------------------------------------------ view model
@@ -341,8 +382,8 @@ export class StepPanel {
       compare: this.compareIds.get(this.stepId),
       estimate,
       scripts,
-      grid: (view.includes('grid') && !!seg?.files['canh']) || (view.includes('lines') && !!seg?.files['loi']),
-      gridKind: view.includes('lines') ? 'lines' : 'scenes',
+      grid: (view.includes('grid') && !!seg?.files['canh']) || (view.includes('lines') && !!seg?.files['loi']) || (view.includes('synopsis') && !!this.studio.config?.project.episodeList),
+      gridKind: view.includes('lines') ? 'lines' : view.includes('synopsis') ? 'episodes' : 'scenes',
       scene: scene && {
         code: scene.code,
         seconds: scene.seconds,
@@ -350,7 +391,8 @@ export class StepPanel {
         title: scene.title,
       },
       media,
-      runs: this.runs.filter((r) => r.step === rs.step.id),
+      runs: this.runs.filter((r) => r.step === rs.step.id || this.runTargets.has(r.id)),
+      batch: view.includes('outlines'),
       recent,
       hasOutput: !!rs.output,
     };
@@ -363,10 +405,12 @@ export class StepPanel {
 
   // ------------------------------------------------------------------ messages
   private async onMessage(m: any): Promise<void> {
+    if (m.__chat) return this.chat.onMessage(m);
     if (m.__grid) {
       const t = this.state.target;
-      if (!t.seg) return;
-      const kind = this.resolve()?.step.view?.includes('lines') ? 'lines' : 'scenes';
+      const view = this.resolve()?.step.view ?? [];
+      const kind = view.includes('lines') ? 'lines' : view.includes('synopsis') ? 'episodes' : 'scenes';
+      if (!t.seg && kind !== 'episodes') return;
       if (!this.gridCtl || this.gridKind !== kind) {
         this.gridCtl = new GridController(this.studio, (x) => this.panel.webview.postMessage(x), t.ep, t.seg, kind);
         this.gridKind = kind;
@@ -402,6 +446,11 @@ export class StepPanel {
         return this.saveSynopsis(String(m.text ?? ''));
       case 'saveOutline':
         return this.saveOutline(String(m.text ?? ''), m.next === true);
+      case 'olPick':
+        this.state.olEp = String(m.ep ?? '');
+        return this.post();
+      case 'saveOutlineOf':
+        return this.saveOutlineOf(String(m.ep ?? ''), String(m.text ?? ''), m.done === undefined ? undefined : m.done === true, m.next === true);
       case 'copy':
         await vscode.env.clipboard.writeText(String(m.text ?? ''));
         return void vscode.window.showInformationMessage(`Đã chép ${m.label ? m.label + ' — ' : ''}${String(m.text ?? '').length} ký tự.`);
@@ -499,6 +548,7 @@ export class StepPanel {
     const rs = this.resolve();
     const main = this.model();
     if (!rs || !main) return;
+    if (rs.step.view?.includes('outlines')) return this.suggestOutlines(main);
     const lk = this.lock(rs);
     if (lk.blocked) return void vscode.window.showWarningMessage(lk.blocked);
     if (!rs.gate.ok && !skipGate) {
@@ -549,6 +599,7 @@ export class StepPanel {
       outputFile: rs.output?.rel,
     };
     this.runs.unshift(rec);
+    if (rs.step.id !== this.stepId || targetKey(rs.target) !== targetKey(this.state.target)) this.runTargets.set(rec.id, { step: rs.step, target: rs.target });
     writeRun(root, rec, { 'prompt.md': `# SYSTEM\n\n${bp.system}\n\n# PROMPT\n\n${bp.prompt}` });
     this.post();
     const abort = new AbortController();
@@ -565,7 +616,7 @@ export class StepPanel {
       });
       const files: Record<string, string> = { 'answer.md': res.text };
       if (rs.output) {
-        const merged = mergeOutput(this.resolve() ?? rs, extractOutput(res.text));
+        const merged = mergeOutput(resolveStep(this.studio.model!, rs.step, rs.target), extractOutput(res.text));
         const pr = lk.apply(merged);
         files['proposal.md'] = pr.text;
         if (pr.restored.length) vscode.window.showInformationMessage(`AI sửa vào phần đã duyệt — tool khôi phục nguyên văn: ${pr.restored.join(', ')}.`);
@@ -601,7 +652,7 @@ export class StepPanel {
   }
 
   private async openDiff(id: string): Promise<void> {
-    const rs = this.resolve();
+    const rs = this.rsOf(id);
     const prop = this.proposal(id);
     if (!rs?.output || !prop) return;
     if (!rs.output.exists) {
@@ -618,7 +669,7 @@ export class StepPanel {
   }
 
   private async apply(id: string): Promise<void> {
-    const rs = this.resolve();
+    const rs = this.rsOf(id);
     const prop = this.proposal(id);
     const rec = this.run(id);
     if (!rs?.output || !prop || !rec) return;
@@ -635,7 +686,20 @@ export class StepPanel {
     rec.status = 'applied';
     writeRun(this.studio.root!, rec);
     vscode.window.showInformationMessage(`Đã ghi ${rs.output.rel} (bản của ${rec.modelId}). Xem bằng git diff — tool không git add.`);
-    if (rs.step.view?.includes('grid') || rs.step.view?.includes('lines')) this.gridCtl?.load();
+    // ② Chia tập: xóa tập ❌ bỏ, cấp mã cho tập MỚI, đánh lại TAP
+    if (rs.step.protect === 'episodes') {
+      const f = finalizeEpisodeList(this.studio);
+      if (f && (f.removed.length || f.added.length)) {
+        vscode.window.showInformationMessage(`Danh sách tập: ${f.removed.length ? 'xóa tập bỏ ' + f.removed.join(', ') : ''}${f.removed.length && f.added.length ? ' · ' : ''}${f.added.length ? 'cấp mã mới ' + f.added.join(', ') : ''} — đã đánh lại TAP.`);
+      }
+    }
+    // ⑥ / ⑦: tool cấp mã cảnh / số câu cho dòng mới AI ghi "MỚI" / "<cảnh>_L?", rồi tự chạy script đi kèm (chú thích mã · tổng hợp lời)
+    if ((rs.step.protect === 'scenes' || rs.step.protect === 'lines') && rs.target.ep && rs.target.seg) {
+      const added = finalizeCodes(this.studio, rs.target.ep, rs.target.seg, rs.step.protect);
+      if (added.length) vscode.window.showInformationMessage(`Tool cấp mã mới: ${added.join(', ')}.`);
+      for (const id of rs.step.protect === 'scenes' ? ['chu-thich-ma'] : ['tong-hop-loi']) await this.scriptQuiet(id, rs);
+    }
+    if (rs.step.view?.some((v) => ['grid', 'lines', 'synopsis'].includes(v))) this.gridCtl?.load();
     // ④ kịch bản chi tiết: bảng phân đoạn AI viết → nhận dòng mới vào README tập (mục con trên cây)
     if (rs.step.view?.includes('segments')) {
       const { ep } = this.nodes();
@@ -688,6 +752,19 @@ export class StepPanel {
     this.post();
   }
 
+  /** chạy script của dự án (project.yaml scripts) ngầm, không mở terminal — dùng sau khi Nhận; lỗi thì báo + vẫn còn nút chạy tay */
+  private scriptQuiet(id: string, rs: ResolvedStep): Promise<void> {
+    const s = this.studio.config?.project.scripts?.find((x) => x.id === id);
+    if (!s) return Promise.resolve();
+    const cmd = fill(s.command, resolveStep(this.studio.model!, rs.step, rs.target).ph);
+    return new Promise((done) =>
+      exec(cmd, { cwd: this.studio.root, timeout: 120000 }, (err, _out, errOut) => {
+        if (err) vscode.window.showWarningMessage(`Script "${s.label}" lỗi (${String(errOut || err.message).trim().slice(0, 200)}) — chạy tay bằng nút script.`);
+        done();
+      }),
+    );
+  }
+
   private script(id: string): void {
     const rs = this.resolve();
     const s = this.studio.config?.project.scripts?.find((x) => x.id === id);
@@ -711,6 +788,10 @@ export class StepPanel {
     if (kind === 'segment' && seg?.status === 'done') return { ...none, blocked: `Phân đoạn ${seg.code} đã duyệt — bỏ duyệt ở tab tập ④ trước khi cho AI viết lại.` };
     if (kind === 'scene' && scene?.status === 'done') return { ...none, blocked: `Cảnh ${scene.code} đã duyệt — bỏ duyệt trước khi cho AI viết lại.` };
     if (kind === 'segment' || kind === 'scene') return none;
+    if (kind === 'outline') {
+      const t = rs.output?.exists ? fs.readFileSync(rs.output.abs, 'utf8') : '';
+      return outlineStatus(t) === 'done' ? { ...none, blocked: `Dàn ý ${rs.target.ep} đã duyệt — bỏ duyệt trước khi cho AI gợi ý.` } : none;
+    }
     const original = rs.output?.exists ? fs.readFileSync(rs.output.abs, 'utf8') : '';
     if (!original) return none;
     if (kind === 'segments') {
@@ -723,7 +804,8 @@ export class StepPanel {
       const L = p.linesTable ?? { codeColumn: 'Mã', statusColumn: 'Trạng thái' };
       t = { codeColumn: L.codeColumn, codeRe: new RegExp(`^${p.codes.line}$`), statusColumn: L.statusColumn, lockSymbols: [...done, '✍'] };
     }
-    if (kind === 'episodes' && p.episodeList) t = { codeColumn: p.episodeList.codeColumn, codeRe: EPISODE_CODE_RE, statusColumn: p.episodeList.statusColumn, lockSymbols: done };
+    // tập: chỉ khóa ✅ — tập ❌ bỏ thì AI / tool xóa khỏi danh sách (29/10/2026)
+    if (kind === 'episodes' && p.episodeList) t = { codeColumn: p.episodeList.codeColumn, codeRe: EPISODE_CODE_RE, statusColumn: p.episodeList.statusColumn, lockSymbols: p.status.done ?? ['✅'] };
     if (!t) return none;
     const tt = t;
     const codes = lockedRows(original, tt);
@@ -740,8 +822,10 @@ export class StepPanel {
     if (view.includes('outline')) {
       const rs = this.resolve();
       const f = rs?.inputs[0];
-      return { kind: 'outline', file: f?.rel, text: f?.abs && fs.existsSync(f.abs) ? fs.readFileSync(f.abs, 'utf8') : '', next: rs?.step.next };
+      const text = f?.abs && fs.existsSync(f.abs) ? fs.readFileSync(f.abs, 'utf8') : '';
+      return { kind: 'outline', file: f?.rel, text: stripOutlineStatus(text), status: outlineStatus(text), next: rs?.step.next };
     }
+    if (view.includes('outlines')) return this.outlinesVm();
     if (view.includes('prompts')) {
       const { ep, seg, scene } = this.nodes();
       if (!ep || !seg || !scene) return undefined;
@@ -786,30 +870,7 @@ export class StepPanel {
       };
     }
     if (view.includes('synopsis')) {
-      const dirs = new Map(this.studio.model!.episodes.map((e) => [e.id, e]));
-      const rel = p.release;
-      const date = (tap?: string) => {
-        if (!rel || !tap) return '';
-        const d = new Date(rel.firstDate);
-        d.setDate(d.getDate() + (Number(tap.replace(/\D/g, '')) - rel.firstEpisode) * rel.everyDays);
-        return d.toLocaleDateString('vi-VN');
-      };
-      return {
-        kind: 'synopsis',
-        file: p.synopsis,
-        text: p.synopsis ? read(p.synopsis) : '',
-        listFile: p.episodeList?.file,
-        episodes: this.studio.model!.episodeList.map((r) => ({
-          code: r.code,
-          release: r.unreleased ? '' : r.release ?? '',
-          name: r.name,
-          status: r.statusText,
-          dropped: r.dropped,
-          date: r.unreleased ? '' : date(r.release),
-          dir: dirs.get(r.code)?.relDir ?? '',
-        })),
-        runLabel: this.resolve()?.step.runLabel,
-      };
+      return { kind: 'synopsis', file: p.synopsis, text: p.synopsis ? read(p.synopsis) : '', runLabel: this.resolve()?.step.runLabel };
     }
     return undefined;
   }
@@ -834,12 +895,83 @@ export class StepPanel {
     const f = rs?.inputs[0];
     if (!rs || !f?.abs) return;
     fs.mkdirSync(path.dirname(f.abs), { recursive: true });
-    fs.writeFileSync(f.abs, text.replace(/\s*$/, '\n'), 'utf8');
+    const old = fs.existsSync(f.abs) ? fs.readFileSync(f.abs, 'utf8') : '';
+    fs.writeFileSync(f.abs, withOutlineStatus(text, outlineStatus(old) === 'done'), 'utf8');
     this.studio.refresh();
     if (!next || !rs.step.next) return void vscode.window.showInformationMessage(`Đã lưu ${f.rel}.`);
     // ③ → ④: chuyển bước và cho AI chạy luôn
     this.select(rs.step.next.step);
     this.startRuns(false, false);
+  }
+
+  /** file dàn ý của một tập — theo đầu vào đầu tiên của bước cấp tập có view "outline" (pipeline.yaml: {episodeDir}/dan-y.md) */
+  private outlineFile(epId: string): { abs: string; rel: string; step: StepSpec } | undefined {
+    const model = this.studio.model;
+    const step = this.studio.config?.pipeline.steps.find((s) => s.scope === 'episode' && s.view?.includes('outline'));
+    const ep = model && findEpisode(model, epId);
+    if (!model || !step || !ep) return undefined;
+    const f = resolveStep(model, step, { ep: ep.id }).inputs[0];
+    return f?.abs ? { abs: f.abs, rel: f.rel, step } : undefined;
+  }
+
+  /** ③ Dàn ý ở cấp dự án: bảng mọi tập (trạng thái dàn ý) + nội dung dàn ý của tập đang chọn */
+  private outlinesVm() {
+    const model = this.studio.model!;
+    const read = (abs?: string) => (abs && fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '');
+    const rows = model.episodeList.filter((r) => !r.dropped).map((r) => {
+      const f = this.outlineFile(r.code);
+      const text = read(f?.abs);
+      return { code: r.code, release: r.unreleased ? '' : r.release ?? '', name: r.name, hasDir: !!f, file: f?.rel, status: outlineStatus(text), chars: stripOutlineStatus(text).trim().length };
+    });
+    const cur = rows.find((r) => r.code === this.state.olEp) ?? rows.find((r) => r.hasDir) ?? rows[0];
+    const f = cur && this.outlineFile(cur.code);
+    const text = read(f?.abs);
+    return { kind: 'outlines', rows, cur: cur?.code, name: cur?.name, file: f?.rel, hasDir: !!f, text: stripOutlineStatus(text), status: outlineStatus(text), next: f?.step.next };
+  }
+
+  /** ③ Dàn ý ở tab dự án → "Gợi ý dàn ý": AI chạy bước ③ của từng tập chưa duyệt (chưa có → viết mới · có → góp ý thêm / bớt / sửa câu).
+   *  Hỏi trước: tập đang chọn hay mọi tập chưa duyệt, kèm ước tính token. Mỗi tập một thẻ kết quả trong tab này (Xem diff / Nhận riêng). */
+  private async suggestOutlines(m: ModelConfig): Promise<void> {
+    const model = this.studio.model!;
+    const step = this.studio.config?.pipeline.steps.find((s) => s.scope === 'episode' && s.view?.includes('outline') && s.output);
+    if (!step) return void vscode.window.showWarningMessage('pipeline.yaml: bước ③ Dàn ý của tập chưa có output + prompt.');
+    const rows = this.outlinesVm().rows.filter((r) => r.hasDir && r.status !== 'done');
+    if (!rows.length) return void vscode.window.showInformationMessage('Mọi tập đều đã duyệt dàn ý — bỏ duyệt tập nào thì AI mới gợi ý cho tập đó.');
+    const loads = this.models.provider(m).loadsProjectInstructions;
+    const est = (ep: string) => buildPrompt(model, resolveStep(model, step, { ep }), this.request, loads).estInputTokens;
+    const cur = rows.find((r) => r.code === this.state.olEp);
+    const all = `Cả ${rows.length} tập chưa duyệt`;
+    const one = cur ? `Chỉ ${cur.code}` : undefined;
+    const total = rows.reduce((a, r) => a + est(r.code), 0);
+    const pick = await vscode.window.showInformationMessage(
+      `Gợi ý dàn ý (${m.id}) — tập chưa có dàn ý thì AI viết mới, tập có mà chưa duyệt thì AI góp ý (thêm · sửa câu; chỗ nên bớt ghi /*@T … */). Tập ✅ không đụng.\n`
+        + rows.map((r) => `${r.code} ${r.status === 'none' ? 'viết mới' : 'góp ý'}`).join(' · ')
+        + `\n≈ ${Math.round(total / rows.length).toLocaleString('vi-VN')} token / tập · cả ${rows.length} tập ≈ ${total.toLocaleString('vi-VN')} token${cur ? ` · riêng ${cur.code} ≈ ${est(cur.code).toLocaleString('vi-VN')}` : ''}.`,
+      { modal: true },
+      ...(one ? [one] : []),
+      all,
+    );
+    if (!pick) return;
+    const eps = pick === one ? [cur!.code] : rows.map((r) => r.code);
+    // tối đa 2 tập chạy cùng lúc — đỡ nghẽn Claude CLI / giới hạn API
+    const queue = [...eps];
+    const worker = async () => {
+      for (let ep = queue.shift(); ep; ep = queue.shift()) await this.runOne(resolveStep(model, step, { ep }), m);
+    };
+    await Promise.all([worker(), worker()]);
+  }
+
+  /** lưu dàn ý một tập từ tab dự án · done: đổi trạng thái duyệt (undefined = giữ) · next: mở tab tập → ④ AI chia phân đoạn */
+  private saveOutlineOf(epId: string, text: string, done: boolean | undefined, next: boolean): void {
+    const f = this.outlineFile(epId);
+    if (!f) return void vscode.window.showWarningMessage(`Tập ${epId} chưa có thư mục — tạo ở ▦ Danh sách tập (nút 📁).`);
+    const old = fs.existsSync(f.abs) ? fs.readFileSync(f.abs, 'utf8') : '';
+    fs.mkdirSync(path.dirname(f.abs), { recursive: true });
+    fs.writeFileSync(f.abs, withOutlineStatus(text, done ?? outlineStatus(old) === 'done'), 'utf8');
+    this.state.olEp = epId;
+    this.studio.refresh();
+    if (next && f.step.next) return StepPanel.open(this.studio, this.models, f.step.next.step, { ep: epId }, true);
+    vscode.window.showInformationMessage(`${done === true ? 'Đã duyệt' : done === false ? 'Bỏ duyệt' : 'Đã lưu'} dàn ý ${epId} — ${f.rel}.`);
   }
 
   /** ⑤ Kịch bản phân đoạn: ghi lại đúng mục [X] trong kịch bản chi tiết của tập; next → sang ⑥ và AI tạo phân cảnh */
@@ -1087,8 +1219,8 @@ export class StepPanel {
         <div id="runs" class="col" style="margin-top:8px"></div>
         <div id="recent"></div>
       </div>
-      </div>`,
-      CLIENT_JS + gridClientJs(true),
+      </div>${CHAT_BODY}`,
+      CLIENT_JS + gridClientJs(true) + CHAT_JS,
     );
   }
 }
@@ -1163,8 +1295,8 @@ function renderMedia(md, scene) {
 let edKey = null, edDirty = false, gridOn = null;
 function renderEditor(ed) {
   const key = ed ? ed.kind + '|' + JSON.stringify(ed) : null;
-  if (ed && edDirty && edKey && edKey.split('|')[0] === ed.kind) { if (ed.kind === 'synopsis') $('epList').innerHTML = epTable(ed); return; }
-  if (key === edKey && ed) { if (ed.kind === 'synopsis') $('epList').innerHTML = epTable(ed); return; }
+  if (ed && edDirty && edKey && edKey.split('|')[0] === ed.kind) return;
+  if (key === edKey && ed) return;
   edKey = key; edDirty = false;
   if (!ed) { $('editor').innerHTML = ''; return; }
   const dirtyMark = '<span id="edDirty" class="err"></span>';
@@ -1197,8 +1329,26 @@ function renderEditor(ed) {
       + (ed.next ? '<button id="secNext" title="lưu → sang bước sau → AI chạy luôn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu → sang ⑥ → AI chia cảnh (xem diff rồi Nhận, lưới cập nhật)</span>' : '') + '</div>';
     return;
   }
+  if (ed.kind === 'outlines') {
+    const lab = { done: '<span class="ok">✅ đã duyệt</span>', todo: '⬜ chưa duyệt', none: '<span class="muted">— chưa có</span>' };
+    let h = '<h2>Dàn ý từng tập <span class="muted">chọn một tập → sửa ở khung bên dưới · mỗi tập một file <code>EPISODES/EPxx/dan-y.md</code></span></h2>'
+      + '<table id="olList"><tr><th>Mã</th><th>Phát hành</th><th>Tên tập</th><th>Dàn ý</th><th>Độ dài</th></tr>'
+      + ed.rows.map((r) => '<tr class="olRow' + (r.code === ed.cur ? ' cur' : '') + '" data-ep="' + esc(r.code) + '" style="cursor:pointer' + (r.code === ed.cur ? ';outline:2px solid var(--vscode-focusBorder)' : '') + (r.hasDir ? '' : ';opacity:.5') + '">'
+        + '<td>' + esc(r.code) + '</td><td>' + esc(r.release || '—') + '</td><td>' + esc(r.name) + '</td><td>' + (r.hasDir ? lab[r.status] : '<span class="muted">chưa có thư mục</span>') + '</td><td>' + (r.chars ? r.chars + ' ký tự' : '') + '</td></tr>').join('')
+      + '</table><div id="olWarn" class="err"></div>';
+    if (ed.cur) {
+      h += '<h2 style="margin-top:14px">' + esc(ed.cur) + ' · ' + esc(ed.name) + ' <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a> · ' : '') + (ed.hasDir ? lab[ed.status] : '') + '</span></h2>';
+      if (!ed.hasDir) h += '<p class="muted">Tập này chưa có thư mục — tạo ở <b>▦ Danh sách tập</b> (nút 📁) rồi viết dàn ý.</p>';
+      else h += '<textarea id="olAllText" data-ep="' + esc(ed.cur) + '" style="min-height:360px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+        + '<div class="row" style="margin-top:6px"><button class="sec" id="olAllSave">Lưu dàn ý</button>'
+        + (ed.status === 'done' ? '<button class="sec" id="olAllUndo">Bỏ duyệt</button>' : '<button id="olAllAppr" title="lưu + đánh dấu dàn ý đã duyệt">✅ Duyệt dàn ý</button>') + dirtyMark
+        + (ed.next ? '<button id="olAllNext" title="lưu dàn ý → mở tab tập ở ④ → AI chia phân đoạn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu → mở tab tập → AI chia phân đoạn (xem diff rồi Nhận)</span>' : '') + '</div>';
+    }
+    $('editor').innerHTML = h;
+    return;
+  }
   if (ed.kind === 'outline') {
-    $('editor').innerHTML = '<h2>Dàn ý <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a>' : '') + '</span></h2>'
+    $('editor').innerHTML = '<h2>Dàn ý <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a>' : '') + (ed.status === 'done' ? ' · <span class="ok">✅ đã duyệt</span>' : '') + '</span></h2>'
       + '<textarea id="olText" style="min-height:360px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
       + '<div class="row" style="margin-top:6px"><button class="sec" id="saveOl">Lưu dàn ý</button>' + dirtyMark
       + (ed.next ? '<button id="olNext" title="lưu dàn ý → chuyển sang bước sau → AI chạy luôn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu dàn ý → sang ④ → AI chia phân đoạn (xem diff rồi Nhận)</span>' : '') + '</div>';
@@ -1209,7 +1359,7 @@ function renderEditor(ed) {
       + '<p class="muted">AI chia phân đoạn bằng nút <b>✨ Tạo phân đoạn</b> ở mục AI bên dưới (xem diff → Nhận: phân đoạn mới vào bảng, ⬜ chưa duyệt). Đọc · sửa (<b>xem</b> mở đúng mục trong kịch bản) · chọn <b>Đã duyệt</b> → <b>Lưu trạng thái</b> → <b>🎬 Phân cảnh</b>.</p>'
       + '<div id="segList">' + segTable(ed) + '</div>'
       + '<div class="row" style="margin-top:6px"><button class="sec" id="saveSeg">Lưu trạng thái</button>' + dirtyMark
-      + '<button id="phanCanh" title="phân đoạn đã duyệt mà chưa có cảnh → tạo mục con + AI chia cảnh">🎬 Phân cảnh</button><span class="muted">tạo mục con cho phân đoạn đã duyệt + AI chia cảnh luôn</span></div>';
+      + '<button id="phanCanh" title="phân đoạn đã duyệt mà chưa có cảnh → tool tạo mục con + AI chia cảnh">✨ Phân cảnh</button><span class="muted">tạo mục con cho phân đoạn đã duyệt + AI chia cảnh luôn</span></div>';
     return;
   }
   if (ed.kind === 'idea') {
@@ -1230,9 +1380,8 @@ function renderEditor(ed) {
     + '<textarea id="synText" style="min-height:280px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
     + '<div class="row" style="margin-top:6px"><button id="saveSyn">Lưu kịch bản tóm tắt</button>' + dirtyMark
     + (ed.runLabel ? '<button data-cmd="run" data-arg="" title="AI đọc ý tưởng + kịch bản tóm tắt + danh sách hiện tại → đề xuất danh sách tập mới; xem diff rồi Nhận">✨ ' + esc(ed.runLabel) + '</button><span class="muted">AI đề xuất → Xem diff → Nhận → sửa tiếp trong lưới</span>' : '') + '</div>'
-    + '<h2>Danh sách tập <button class="sec" data-cmd="episodes">▦ Sửa danh sách tập (thêm · bỏ · đổi thứ tự)</button></h2>'
-    + '<p class="muted">Mã <b>EP</b> = mã sản xuất, cấp một lần, không đổi, bỏ thì không dùng lại · <b>TAP</b> = số phát hành, tool đánh lại theo thứ tự dòng (bỏ qua tập ❌ bỏ / ⏸ chờ).</p>'
-    + '<div id="epList">' + epTable(ed) + '</div>';
+    + '<p class="muted" style="margin-top:10px"><b>Chia tập</b>: AI giữ nguyên tập ✅ Duyệt · chia lại, viết lại tên + tóm tắt cho tập ⬜ Chưa duyệt · xóa tập ❌ Bỏ · viết tóm tắt cho tập chưa có → tool đánh lại TAP. '
+    + 'Sửa tay ngay trong lưới dưới đây: ô tên / tóm tắt / trạng thái · ▲▼ đổi thứ tự · <b>+</b> thêm tập · 🗑 xóa tập ❌ · nhớ bấm <b>Lưu</b> của lưới. Mã <b>EP</b> = mã sản xuất (không đổi) · <b>TAP</b> = số phát hành.</p>';
 }
 // markdown gọn: khối code (ba dấu huyền) thành <pre> có nút 📋 chép, chữ thường giữ đậm / code
 // mục "### Ghi chú [X]" ở cuối phân đoạn ↔ ô Ghi chú riêng
@@ -1274,14 +1423,8 @@ function segTable(ed) {
     + (ed.script ? '<button class="link" data-open="' + esc(ed.script) + '" data-line="' + x.line + '">xem</button>' : '')
     + (x.hasDir ? '<button class="link" data-cmd="target" data-arg="' + esc(JSON.stringify({ ep: ed.ep, seg: x.code })) + '">mở</button>' : '') + '</td></tr>').join('') + '</table>';
 }
-function epTable(ed) {
-  if (!ed.episodes.length) return '<p class="muted">Chưa có tập nào' + (ed.listFile ? ' trong ' + esc(ed.listFile) : '') + '.</p>';
-  return '<table><tr><th>Mã</th><th>Phát hành</th><th>Tên tập</th><th>Trạng thái</th><th>Lịch</th><th>Thư mục</th></tr>' + ed.episodes.map((e) =>
-    '<tr' + (e.dropped ? ' style="opacity:.5"' : '') + '><td>' + esc(e.code) + '</td><td>' + esc(e.release || '—') + '</td><td>' + esc(e.name) + '</td><td>' + esc(e.status) + '</td><td>' + esc(e.date) + '</td><td>'
-    + (e.dir ? '<a data-cmd="target" data-arg="' + esc(JSON.stringify({ ep: e.code })) + '">mở</a>' : '<span class="muted">chưa có</span>') + '</td></tr>').join('') + '</table>';
-}
 document.addEventListener('input', (e) => {
-  if (e.target.closest('#editor') && (e.target.matches('.ideaF, .ideaO, #synText, #olText, #secText, #secNote'))) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
+  if (e.target.closest('#editor') && (e.target.matches('.ideaF, .ideaO, #synText, #olText, #olAllText, #secText, #secNote'))) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
 });
 document.addEventListener('change', (e) => {
   if (e.target.matches && e.target.matches('select.ideaF, select.segSt')) { edDirty = true; const d = $('edDirty'); if (d) d.textContent = ' ● chưa lưu'; }
@@ -1300,6 +1443,17 @@ document.addEventListener('click', (e) => {
     const head = splitNote(window._secOrig || '').head, code = ((window._secOrig || '').match(/\\[([A-Z])\\]/) || [])[1] || '';
     edDirty = false; edKey = null;
     vscode.postMessage({ type: 'saveSection', text: joinNote($('secText').value, $('secNote').value, code, head), next: e.target.id === 'secNext' });
+  }
+  const olRow = e.target.closest && e.target.closest('.olRow');
+  if (olRow && !olRow.classList.contains('cur')) {
+    if (edDirty) { $('olWarn').innerHTML = 'Dàn ý ' + esc($('olAllText').dataset.ep) + ' đang sửa dở — bấm <b>Lưu dàn ý</b> trước, hoặc <a id="olDiscard" data-ep="' + esc(olRow.dataset.ep) + '">bỏ thay đổi và chuyển</a>.'; return; }
+    edKey = null; vscode.postMessage({ type: 'olPick', ep: olRow.dataset.ep });
+  }
+  if (e.target.id === 'olDiscard') { edDirty = false; edKey = null; vscode.postMessage({ type: 'olPick', ep: e.target.dataset.ep }); }
+  if (['olAllSave', 'olAllAppr', 'olAllUndo', 'olAllNext'].includes(e.target.id)) {
+    const t = $('olAllText');
+    edDirty = false; edKey = null;
+    vscode.postMessage({ type: 'saveOutlineOf', ep: t.dataset.ep, text: t.value, done: e.target.id === 'olAllAppr' ? true : e.target.id === 'olAllUndo' ? false : undefined, next: e.target.id === 'olAllNext' });
   }
   if (e.target.id === 'saveOl' || e.target.id === 'olNext') { edDirty = false; edKey = null; vscode.postMessage({ type: 'saveOutline', text: $('olText').value, next: e.target.id === 'olNext' }); }
   if (e.target.id === 'saveSeg') {
@@ -1391,11 +1545,12 @@ function render(vm) {
   $('est').innerHTML = vm.estimate ? '<span class="' + (vm.estimate.tokens > vm.estimate.cap ? 'err' : '') + '">ngữ cảnh ≈ ' + vm.estimate.tokens.toLocaleString('vi-VN') + ' token</span>'
       + (vm.estimate.usd !== undefined ? ' · ≈ ' + vm.estimate.usd.toFixed(3) + ' USD tiền vào' : '') : '';
   let a = '';
-  if (vm.step.executor === 'agent') a = '<button data-cmd="handoff">Giao cho Claude Code (terminal)</button>';
-  else if (vm.hasOutput) {
+  if (vm.step.executor === 'agent') a = '<button data-cmd="handoff" title="AI agent: mở Claude Code trong terminal">🤖 Giao cho Claude Code (terminal)</button>';
+  else if (vm.hasOutput || vm.batch) {
     const skip = vm.gate.ok ? '' : 'skip';
-    a = '<button data-cmd="run" data-arg="' + skip + '">' + (vm.gate.ok ? (vm.step.runLabel || 'Chạy') : (vm.step.runLabel || 'Chạy') + ' (bỏ qua cổng)') + '</button>'
-      + (vm.compare ? ' <button class="sec" data-cmd="runCompare" data-arg="' + skip + '">Chạy cả 2 để so sánh</button>' : '');
+    // ✨ = nút có AI (quy ước toàn tool) — nút không dấu là việc tool tự làm
+    a = '<button data-cmd="run" data-arg="' + skip + '" title="chạy AI">✨ ' + esc(vm.step.runLabel || 'Chạy AI') + (vm.gate.ok ? '' : ' (bỏ qua cổng)') + '</button>'
+      + (vm.compare ? ' <button class="sec" data-cmd="runCompare" data-arg="' + skip + '">✨ Chạy cả 2 để so sánh</button>' : '');
   }
   $('actions').innerHTML = a;
 
@@ -1405,12 +1560,13 @@ function render(vm) {
     const label = { running: '⏳ đang chạy…', done: '✅ xong', error: '❌ lỗi', applied: '✅ đã ghi vào file', discarded: 'đã bỏ', 'handed-off': '↗ đã giao Claude Code' }[x.status] || x.status;
     let b = '';
     if (x.status === 'running') b = '<button class="sec" data-cmd="cancel" data-arg="' + esc(x.id) + '">Hủy</button>';
-    if (x.status === 'done') b = vm.hasOutput ? '<button data-cmd="diff" data-arg="' + esc(x.id) + '">Xem diff</button><button data-cmd="apply" data-arg="' + esc(x.id) + '">Nhận</button>'
+    const out = vm.hasOutput || !!x.outputFile;
+    if (x.status === 'done') b = out ? '<button data-cmd="diff" data-arg="' + esc(x.id) + '">Xem diff</button><button data-cmd="apply" data-arg="' + esc(x.id) + '">Nhận</button>'
       : '<button data-cmd="answer" data-arg="' + esc(x.id) + '">Xem trả lời</button>';
     if (x.status !== 'running') b += '<button class="sec" data-cmd="discard" data-arg="' + esc(x.id) + '">' + (x.status === 'done' ? 'Bỏ' : 'Ẩn') + '</button>';
-    return '<div class="card"><b>' + esc(x.modelId) + '</b> · ' + label + tok + cost
+    return '<div class="card">' + (vm.batch ? '<b>' + esc(String(x.target).split('·')[0]) + '</b> · ' : '') + '<b>' + esc(x.modelId) + '</b> · ' + label + tok + cost
       + (x.error ? '<div class="err">' + esc(x.error) + '</div>' : '')
-      + '<div class="row" style="margin-top:6px">' + b + (x.status === 'done' && vm.hasOutput ? '<span class="muted">Nhận một phần: sửa bản bên phải trong diff rồi bấm Nhận</span>' : '') + '</div></div>';
+      + '<div class="row" style="margin-top:6px">' + b + (x.status === 'done' && out ? '<span class="muted">Nhận một phần: sửa bản bên phải trong diff rồi bấm Nhận</span>' : '') + '</div></div>';
   }).join('');
   $('recent').innerHTML = vm.recent.length ? '<h2>Lần chạy gần đây</h2><table>' + vm.recent.map((x) =>
     '<tr><td>' + esc(x.startedAt.slice(0, 16).replace('T', ' ')) + '</td><td>' + esc(x.modelId) + '</td><td>' + esc(x.status) + '</td><td>'

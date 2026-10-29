@@ -12,6 +12,7 @@ import { Studio } from './studio';
 
 export type ProjectNode =
   | { kind: 'dashboard' }
+  | { kind: 'guides' }
   | { kind: 'resources' }
   | { kind: 'resGroup'; group: string; entries: ResourceEntry[] }
   | { kind: 'resDir'; entry: ResourceEntry }
@@ -46,7 +47,9 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
   getChildren(n?: ProjectNode): ProjectNode[] {
     const model = this.studio.model;
     if (!model) return [];
-    if (!n) return [{ kind: 'dashboard' }, { kind: 'resources' }, { kind: 'project' }, ...model.episodes.map((ep) => ({ kind: 'episode' as const, ep }))];
+    if (!n) return [{ kind: 'dashboard' }, { kind: 'guides' }, { kind: 'resources' }, { kind: 'project' }, ...model.episodes.map((ep) => ({ kind: 'episode' as const, ep }))];
+    if (n.kind === 'guides')
+      return listResources(model.config.root, model.config.project.guides).map((g) => ({ kind: 'resGroup' as const, group: g.group, entries: g.entries }));
     if (n.kind === 'resources')
       return listResources(model.config.root, model.config.project.resources).map((g) => ({ kind: 'resGroup' as const, group: g.group, entries: g.entries }));
     if (n.kind === 'resGroup')
@@ -68,6 +71,13 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
         const it = new vscode.TreeItem('Trạng thái dự án', C.None);
         it.iconPath = new vscode.ThemeIcon('dashboard');
         it.command = { command: 'aiFilmStudio.openDashboard', title: '' };
+        return it;
+      }
+      case 'guides': {
+        const it = new vscode.TreeItem('Tài liệu hướng dẫn', C.Collapsed);
+        it.iconPath = new vscode.ThemeIcon('question');
+        it.description = 'tool · quy trình · Blender · Dreamina · KdenLive';
+        it.tooltip = 'Hướng dẫn cho người làm phim — cấu hình ở .studio/project.yaml (guides)';
         return it;
       }
       case 'resources': {
@@ -105,7 +115,7 @@ export class ProjectTree implements vscode.TreeDataProvider<ProjectNode> {
       }
       case 'project': {
         const it = new vscode.TreeItem('Ý tưởng – phong cách', C.None);
-        it.description = '① ý tưởng · ② tóm tắt + chia tập';
+        it.description = '① ý tưởng · ② tóm tắt + chia tập · ③ dàn ý';
         it.iconPath = new vscode.ThemeIcon('book');
         it.contextValue = 'project';
         it.command = { command: 'aiFilmStudio.openTarget', title: '', arguments: [n] };

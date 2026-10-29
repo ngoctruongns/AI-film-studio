@@ -1,12 +1,13 @@
 // Tab sửa bảng dạng lưới — bảng cảnh <X>_canh.md và danh sách tập: sửa ô, đổi thứ tự, thêm dòng (cấp mã), đánh dấu bỏ.
-// Chỉ ghi lại khối dòng của bảng — phần chữ khác trong file giữ nguyên. Không bao giờ xóa dòng (mã đã cấp không dùng lại).
+// Chỉ ghi lại khối dòng của bảng — phần chữ khác trong file giữ nguyên. Bảng cảnh không bao giờ xóa dòng; danh sách tập xóa được dòng ❌ bỏ
+// (🗑 trong lưới, hoặc Chia tập) — mã EP đã cấp vẫn nằm trong sổ mã, không dùng lại.
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { ledgerPath, loadLedger, nextSceneCode, reserveEpisode, reserveScene, saveLedger } from '../core/codes';
 import { EPISODE_CODE_RE, EpisodeListConfig, nextEpisodeCode, numberReleases, slugify } from '../core/episodeList';
 import { copyDir } from './commands';
-import { columnIndex } from '../core/markdown';
+import { columnIndex, stripMd } from '../core/markdown';
 import { findEpisode, findSegment } from '../core/scanner';
 import { Grid, GridRow, readGrid, writeGrid } from '../core/tableEdit';
 import { Studio } from './studio';
@@ -74,7 +75,7 @@ export class GridController {
     private ep: string | undefined,
     private seg: string | undefined,
     /** lines = bảng lời <X>_loi.md của phân đoạn (bước ⑦) */
-    private kind: 'scenes' | 'lines' = 'scenes',
+    private kind: 'scenes' | 'lines' | 'episodes' = 'scenes',
   ) {}
 
   private makeSpec(): GridSpec | string {
@@ -211,6 +212,8 @@ export class GridController {
       statusIndex: si,
       release: spec.release && { index: col(spec.release.column), prefix: spec.release.prefix, skip: spec.release.skip, fixed: spec.release.fixed },
       haveDir: spec.haveDir,
+      // lịch phát hành (cột chỉ đọc cuối lưới tập): TAP firstEpisode ra ngày firstDate, mỗi tập cách everyDays
+      schedule: spec.noun === 'tập' ? p.release : undefined,
       dropSymbol: p.status.dropped?.[0] ?? '❌',
       statusChoices: spec.statusChoices,
       widths: { ...defaults, ...this.studio.context.globalState.get<Record<string, number>>(WIDTH_KEY, {}) },
@@ -274,6 +277,15 @@ export class GridController {
           if (nc) r.cells[ci] = `**${nc}**`;
         }
         this.spec.beforeSave?.(this.grid.headers, rows);
+        if (this.spec.noun === 'tập') {                    // tập xóa bằng 🗑: mã vẫn ghi trong sổ → không cấp lại
+          const lp = ledgerPath(this.studio.model!);
+          const ledger = loadLedger(lp);
+          for (const r of this.grid.rows) {
+            const c = r.cells[ci]?.replace(/[*~]/g, '').trim() ?? '';
+            if (EPISODE_CODE_RE.test(c)) reserveEpisode(ledger, c);
+          }
+          saveLedger(lp, ledger);
+        }
         fs.writeFileSync(file, writeGrid(this.grid, rows), 'utf8');
         vscode.window.showInformationMessage(`Đã lưu ${this.seg ? 'bảng cảnh ' + this.seg : 'danh sách tập'} (${rows.length} dòng). Xem bằng git diff.`);
         this.studio.refresh();
@@ -283,12 +295,97 @@ export class GridController {
   }
 }
 
+/** Sau khi Nhận bản "Chia tập" của AI: xóa dòng ❌ bỏ, cấp mã cho dòng MỚI, đánh lại số phát hành. Mã bị xóa vẫn giữ trong sổ mã. */
+export function finalizeEpisodeList(studio: Studio): { removed: string[]; added: string[] } | undefined {
+  const model = studio.model;
+  const L = model?.config.project.episodeList;
+  if (!model || !L || !studio.exists(L.file)) return undefined;
+  const file = studio.abs(L.file);
+  const g = readGrid(fs.readFileSync(file, 'utf8'), L.codeColumn, /^(EP\d{2,}|MỚI|MOI|NEW)$/i);
+  if (!g) return undefined;
+  const si = columnIndex({ line: 0, headers: g.headers, rows: [] }, L.statusColumn);
+  const drop = model.config.project.status.dropped?.[0] ?? '❌';
+  const code = (r: GridRow) => stripMd(r.cells[g.codeIndex] ?? '').replace(/~/g, '').trim();
+  const lp = ledgerPath(model);
+  const ledger = loadLedger(lp);
+  const removed: string[] = [];
+  const added: string[] = [];
+  const rows: GridRow[] = [];
+  for (const r of g.rows) {
+    const c = code(r);
+    if (EPISODE_CODE_RE.test(c)) reserveEpisode(ledger, c);
+    if (si >= 0 && (r.cells[si] ?? '').includes(drop)) removed.push(c);
+    else rows.push({ line: r.line, cells: r.cells.slice() });
+  }
+  for (const r of rows) {
+    if (EPISODE_CODE_RE.test(code(r))) continue;
+    const c = nextEpisodeCode([...Object.keys(ledger.episodes), ...model.episodes.map((e) => e.id), ...model.episodeList.map((x) => x.code), ...rows.map(code)]);
+    reserveEpisode(ledger, c);
+    r.cells[g.codeIndex] = `**${c}**`;
+    added.push(c);
+  }
+  saveLedger(lp, ledger);
+  numberReleases(g.headers, rows, L);
+  fs.writeFileSync(file, writeGrid(g, rows), 'utf8');
+  return { removed, added };
+}
+
+/** Sau khi Nhận bản AI của ⑥ / ⑦: tool cấp mã cho dòng mới — AI không tự đánh mã (Trường 30/10/2026).
+ *  scenes: ô Mã không phải mã cảnh (vd. "MỚI") → mã cảnh kế tiếp chưa dùng theo sổ mã (mã đã bỏ không dùng lại).
+ *  lines: ô Mã "<cảnh>_L?" / "<cảnh>_LMỚI" / "<cảnh>_L" → số câu kế tiếp của cảnh đó. Trả danh sách mã vừa cấp. */
+export function finalizeCodes(studio: Studio, ep: string, seg: string, kind: 'scenes' | 'lines'): string[] {
+  const model = studio.model;
+  const s = model && findSegment(findEpisode(model, ep), seg);
+  const file = s?.files[kind === 'scenes' ? 'canh' : 'loi'];
+  if (!model || !file || !fs.existsSync(file)) return [];
+  const p = model.config.project;
+  const codeCol = kind === 'scenes' ? p.sceneTable.codeColumn : p.linesTable?.codeColumn ?? 'Mã';
+  // chỉ nhận bảng có dòng mang mã cảnh / mã câu / MỚI — tránh nhầm bảng chú thích mã đứng trước (cột "Mã — nghĩa")
+  const sceneSrc = p.codes.scene.replace(/^\^|\$$/g, '');
+  const pick = kind === 'scenes' ? new RegExp(`^(?:${sceneSrc}|MỚI|MOI|NEW)$`, 'i') : /^[A-Z]\d{2}_L/;
+  const g = readGrid(fs.readFileSync(file, 'utf8'), codeCol, pick);
+  if (!g) return [];
+  const code = (r: GridRow) => stripMd(r.cells[g.codeIndex] ?? '').replace(/~/g, '').trim();
+  const added: string[] = [];
+  const rows = g.rows.map((r) => ({ line: r.line, cells: r.cells.slice() }));
+  if (kind === 'scenes') {
+    const re = new RegExp(`^${p.codes.scene}$`);
+    const lp = ledgerPath(model);
+    const ledger = loadLedger(lp);
+    for (const r of rows) if (re.test(code(r))) reserveScene(ledger, ep, code(r));
+    for (const r of rows) {
+      if (re.test(code(r)) || !/^(MỚI|MOI|NEW|\?|\+)?$/i.test(code(r)) && code(r) !== '') continue;
+      if (!r.cells.some((c, i) => i !== g.codeIndex && c.trim())) continue;     // dòng trống
+      const c = nextSceneCode(ledger, ep, seg);
+      if (!c) break;
+      reserveScene(ledger, ep, c);
+      r.cells[g.codeIndex] = `**${c}**`;
+      added.push(c);
+    }
+    saveLedger(lp, ledger);
+  } else {
+    const max = new Map<string, number>();
+    for (const r of rows) {
+      const m = /^([A-Z]\d{2})_L(\d+)$/.exec(code(r));
+      if (m) max.set(m[1], Math.max(max.get(m[1]) ?? 0, Number(m[2])));
+    }
+    for (const r of rows) {
+      const m = /^([A-Z]\d{2})_L(\?|MỚI|MOI|\+)?$/i.exec(code(r));
+      if (!m) continue;
+      const n = (max.get(m[1]) ?? 0) + 1;
+      max.set(m[1], n);
+      r.cells[g.codeIndex] = r.cells[g.codeIndex].replace(/[A-Z]\d{2}_L\S*/, `${m[1]}_L${n}`);
+      added.push(`${m[1]}_L${n}`);
+    }
+  }
+  if (added.length) fs.writeFileSync(file, writeGrid(g, rows), 'utf8');
+  return added;
+}
+
 /** File danh sách tập trống — đúng các cột trong cấu hình */
 function emptyEpisodeList(L: EpisodeListConfig): string {
   const cols = [L.codeColumn, L.releaseColumn, L.nameColumn, ...(L.summaryColumn ? [L.summaryColumn] : []), L.statusColumn];
   return `# Danh sách tập
-
-> Sửa trong tool (▦ Danh sách tập). Mã ${L.codeColumn} cấp một lần, không đổi; cột ${L.releaseColumn} tool tự đánh theo thứ tự dòng.
 
 | ${cols.join(' | ')} |
 |${cols.map(() => '---').join('|')}|
@@ -342,6 +439,7 @@ export const GRID_BODY = `
 export function gridClientJs(embedded: boolean): string {
   return `(function () {
 const post = (m) => vscode.postMessage(${embedded ? "Object.assign({ __grid: true }, m)" : 'm'});
+const EMB = ${embedded};
 window.gridReload = () => post({ type: 'reload' });
 window.gridDirty = () => dirty;
 
@@ -363,7 +461,7 @@ window.addEventListener('message', (e) => {
   if (m.type === 'error') { $('gErr').innerHTML = '<p class="err">' + esc(m.text) + '</p>'; }
   if (m.type === 'grid') { G = m;
     document.querySelectorAll('.noun').forEach((x, i) => (x.textContent = i === 0 ? (m.noun === 'tập' ? 'phát hành' : 'chiếu') : m.noun));
-    $('relHelp').innerHTML = m.release ? ' · cột <b>' + esc(m.headers[m.release.index] || '') + '</b> tool tự đánh theo thứ tự dòng, bỏ qua tập ' + m.release.skip.map(esc).join(' ') + ' · <b>⤴</b> gộp vào tập phát hành dòng trên (1 TAP nhiều EP), <b>⤵</b> tách ra · <b>📁</b> tạo thư mục cho tập chưa có' : ''; rows = m.rows.map((r) => ({ line: r.line, cells: r.cells.slice() })); dirty = false; $('gDirty').textContent = ''; $('gTitle').textContent = m.title; render(); }
+    $('relHelp').innerHTML = m.release ? ' · cột <b>' + esc(m.headers[m.release.index] || '') + '</b> tool tự đánh theo thứ tự dòng, bỏ qua tập ' + m.release.skip.map(esc).join(' ') + ' · <b>⤴</b> gộp vào tập phát hành dòng trên (1 TAP nhiều EP), <b>⤵</b> tách ra · <b>📁</b> tạo thư mục cho tập chưa có · <b>🗑</b> xóa hẳn tập ❌ bỏ (mã không dùng lại)' : ''; rows = m.rows.map((r) => ({ line: r.line, cells: r.cells.slice() })); dirty = false; $('gDirty').textContent = ''; $('gTitle').textContent = m.title; render(); }
   if (m.type === 'newCode') {
     const cells = G.headers.map(() => '');
     cells[G.codeIndex] = G.plainCode ? m.code : '**' + m.code + '**';
@@ -386,32 +484,40 @@ function renumber() {
     else r.cells[R.index] = last = R.prefix + String(++n).padStart(2, '0');
   }
 }
+function dateOf(r) {
+  const S = G.schedule, m = S && /(\\d+)/.exec(String(r.cells[G.release.index] || ''));
+  if (!m || String(r.cells[G.release.index]).trim().startsWith('↑')) return '';
+  const d = new Date(S.firstDate); d.setDate(d.getDate() + (Number(m[1]) - S.firstEpisode) * S.everyDays);
+  return d.toLocaleDateString('vi-VN');
+}
 function render() {
   renumber();
   $('lists').innerHTML = Object.entries(G.lists).map(([i, vals]) => '<datalist id="dl' + i + '">' + vals.map((v) => '<option value="' + esc(v) + '">').join('') + '</datalist>').join('');
   const W = (h) => G.widths[h] || 140;
-  $('grid').style.width = (92 + G.headers.reduce((a, h) => a + W(h), 0)) + 'px';
-  $('grid').innerHTML = '<colgroup><col style="width:92px">' + G.headers.map((h) => '<col style="width:' + W(h) + 'px">').join('') + '</colgroup>'
-    + '<tr><th></th>' + G.headers.map((h, i) => '<th title="' + esc(h) + '">' + esc(h) + '<div class="rz" data-rz="' + i + '"></div></th>').join('') + '</tr>' + rows.map((r, ri) => {
+  const SW = G.schedule ? 120 : 0;
+  $('grid').style.width = (92 + SW + G.headers.reduce((a, h) => a + W(h), 0)) + 'px';
+  $('grid').innerHTML = '<colgroup><col style="width:92px">' + G.headers.map((h) => '<col style="width:' + W(h) + 'px">').join('') + (SW ? '<col style="width:' + SW + 'px">' : '') + '</colgroup>'
+    + '<tr><th></th>' + G.headers.map((h, i) => '<th title="' + esc(h) + '">' + esc(h) + '<div class="rz" data-rz="' + i + '"></div></th>').join('') + (SW ? '<th>Lịch</th>' : '') + '</tr>' + rows.map((r, ri) => {
     const dropped = G.statusIndex >= 0 && String(r.cells[G.statusIndex]).includes(G.dropSymbol);
     return '<tr' + (dropped ? ' style="opacity:.5"' : '') + '><td style="white-space:nowrap">'
       + '<button class="link" data-a="up" data-r="' + ri + '">▲</button><button class="link" data-a="down" data-r="' + ri + '">▼</button>'
       + '<button class="link" data-a="add" data-r="' + ri + '" title="thêm dòng mới dưới dòng này (tool cấp mã)">+</button>'
       + (G.statusIndex >= 0 ? '<button class="link" data-a="drop" data-r="' + ri + '">' + (dropped ? 'khôi phục' : 'bỏ') + '</button>' : '')
       + (G.release && ri > 0 ? '<button class="link" data-a="merge" data-r="' + ri + '" title="' + (String(r.cells[G.release.index]).startsWith('↑') ? 'tách ra thành tập phát hành riêng' : 'gộp vào tập phát hành ở dòng trên (1 TAP gồm nhiều EP)') + '">' + (String(r.cells[G.release.index]).startsWith('↑') ? '⤵' : '⤴') + '</button>' : '')
+      + (G.noun === 'tập' && dropped ? '<button class="link" data-a="del" data-r="' + ri + '" title="xóa hẳn dòng — mã EP không dùng lại">🗑</button>' : '')
       + (G.haveDir && !dropped && r.line >= 0 && /^EP\\d{2,}$/.test(codeOf(r)) && !G.haveDir.includes(codeOf(r)) ? '<button class="link" data-a="mkdir" data-r="' + ri + '" title="tạo thư mục tập từ mẫu">📁</button>' : '') + '</td>'
       + r.cells.map((c, ci) => {
         const rel = G.release && ci === G.release.index;
         const ro = (ci === G.codeIndex && r.line >= 0) || rel;
         const attrs = ' data-r="' + ri + '" data-c="' + ci + '"';
         if (ci === G.wideIndex) return '<td><textarea' + attrs + ' style="min-height:56px">' + esc(c) + '</textarea></td>';
-        if (ci === G.statusIndex && G.statusChoices.length && !dropped) {
+        if (ci === G.statusIndex && G.statusChoices.length && (!dropped || G.statusChoices.some((o) => o.value === G.dropSymbol))) {
           const cur = G.statusChoices.find((o) => String(c).trim().startsWith(o.value));
           return '<td><select' + attrs + ' title="' + esc(c) + '">' + (cur ? '' : '<option value="' + esc(c) + '" selected>' + esc(c || '—') + '</option>')
             + G.statusChoices.map((o) => '<option value="' + esc(o.value) + '"' + (cur === o ? ' selected' : '') + '>' + esc(o.value + ' ' + o.label) + '</option>').join('') + '</select></td>';
         }
         return '<td><input' + attrs + ' value="' + esc(c) + '"' + (ro ? ' readonly title="' + (rel ? 'tool tự đánh theo thứ tự dòng' : 'mã đã cấp không đổi') + '"' : '') + (G.lists[ci] ? ' list="dl' + ci + '"' : '') + '></td>';
-      }).join('') + '</tr>';
+      }).join('') + (SW ? '<td class="muted" style="white-space:nowrap">' + esc(dateOf(r)) + (EMB && G.haveDir && G.haveDir.includes(codeOf(r)) ? ' <a data-cmd="target" data-arg="' + esc(JSON.stringify({ ep: codeOf(r) })) + '">mở</a>' : '') + '</td>' : '') + '</tr>';
   }).join('');
   sum();
 }
@@ -420,7 +526,7 @@ function edit(e) {
   rows[+t.dataset.r].cells[+t.dataset.c] = t.value; mark();
 }
 document.addEventListener('input', edit);
-document.addEventListener('change', (e) => { if (e.target.tagName === 'SELECT') edit(e); });
+document.addEventListener('change', (e) => { if (e.target.tagName === 'SELECT') { edit(e); if (G && e.target.dataset.c !== undefined && +e.target.dataset.c === G.statusIndex) render(); } });
 // kéo đổi độ rộng cột
 let RZ = null;
 document.addEventListener('mousedown', (e) => {
@@ -449,6 +555,7 @@ document.addEventListener('click', (e) => {
     if (b.dataset.a === 'up' && i > 0) { [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]]; mark(); render(); }
     if (b.dataset.a === 'down' && i < rows.length - 1) { [rows[i + 1], rows[i]] = [rows[i], rows[i + 1]]; mark(); render(); }
     if (b.dataset.a === 'add') post({ type: 'newCode', after: i, afterCode: codeOf(rows[i]), taken: rows.map(codeOf) });
+    if (b.dataset.a === 'del') { rows.splice(i, 1); mark(); render(); }
     if (b.dataset.a === 'merge') { const c = String(rows[i].cells[G.release.index] || ''); rows[i].cells[G.release.index] = c.startsWith('↑') ? '' : '↑'; mark(); render(); }
     if (b.dataset.a === 'mkdir') { if (dirty) { $('gDirty').textContent = '● lưu bảng trước khi tạo thư mục'; return; } post({ type: 'mkdir', code: codeOf(rows[i]), name: rows[i].cells[G.headers.findIndex((h) => /tên/i.test(h))] || '' }); }
     if (b.dataset.a === 'drop') {

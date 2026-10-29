@@ -82,7 +82,23 @@ function fakeLlm(): Promise<{ port: number; close: () => void }> {
       const cur = /<hien-tai path="[^"]*">\n([\s\S]*?)\n<\/hien-tai>/.exec(prompt);
       if (prompt.startsWith('# ④ KỊCH BẢN CHI TIẾT + PHÂN ĐOẠN') || prompt.includes('\n# ④ KỊCH BẢN CHI TIẾT + PHÂN ĐOẠN'))
         content = '<<<BEGIN>>>\n# KỊCH BẢN CHI TIẾT — thử\n\n## Phân đoạn\n\n| Thứ tự | Mã | Phân đoạn | ~Giây | Trạng thái |\n|---|---|---|---|---|\n| 1 | **A** | Mở đầu thử | 40 | ⬜ chưa duyệt |\n| 2 | **B** | Hội thề thử | 60 | ⬜ chưa duyệt |\n\n## [A] MỞ ĐẦU THỬ\nnội dung\n\n## [B] HỘI THỀ THỬ\nnội dung\n<<<END>>>';
-      else if (prompt.includes('KẾT THÚC PHIÊN')) content = '<<<BEGIN>>>\n### Phiên 999 — thử · KIỂM TRA GUI\n- dòng thử\n<<<END>>>';
+      else if (prompt.includes('# ② KỊCH BẢN TÓM TẮT → CHIA TẬP') && cur) {
+        // AI "sửa" cả tập ✅ (tool phải khôi phục) và thêm một tập MỚI cuối bảng
+        const lines = cur[1].replace('LỜI CHA GIÀ NƠI BIÊN ẢI', 'AI ĐỔI TÊN TẬP ĐÃ DUYỆT').split('\n');
+        const last = lines.map((l, i) => (l.startsWith('|') ? i : -1)).filter((i) => i >= 0).pop()!;
+        lines.splice(last + 1, 0, '| MỚI |  | TẬP MỚI THỬ |  | tóm tắt một dòng thử | ⬜ |');
+        content = `<<<BEGIN>>>\n${lines.join('\n')}\n<<<END>>>`;
+      }
+      else if (prompt.includes('# ⑥ PHÂN CẢNH') && cur) {
+        // thêm một cảnh MỚI cuối bảng cảnh đầu tiên — tool phải cấp mã
+        const L = cur[1].split('\n');
+        const h = L.findIndex((l) => /^\|\s*Mã\s*\|/.test(l));
+        let e = h + 2;
+        while (e < L.length && L[e].startsWith('|')) e++;
+        const w = L[h].split('|').length - 2;
+        L.splice(e, 0, '| MỚI | 6 | cảnh thử mới' + ' | '.repeat(w - 3) + ' | ⬜ |');
+        content = `<<<BEGIN>>>\n${L.join('\n')}\n<!-- ${lastRequest.model} đã sửa -->\n<<<END>>>`;
+      }
       else if (cur) content = `<<<BEGIN>>>\n${cur[1]}\n<!-- ${lastRequest.model} đã sửa -->\n<<<END>>>`;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 1234, completion_tokens: 56 } }));
@@ -124,6 +140,11 @@ function fakeBlender(): Promise<{ port: number; close: () => void }> {
 
 async function main() {
   const root = copyProject();
+  // test cần EP03, EP04 ở trạng thái dàn ý chưa duyệt (dữ liệu thật có thể đã duyệt)
+  for (const ep of ['EP03', 'EP04']) {
+    const f = path.join(root, '04_PRODUCTION/EPISODES', ep, 'dan-y.md');
+    if (fs.existsSync(f)) fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace(/^<!--\s*(?:@tool\s+)?dan-y:[^>]*-->\s*\n?/m, ''));
+  }
   const media = path.join(root, '04_PRODUCTION/VIDEO_OUT/EP01/K');
   fs.mkdirSync(media, { recursive: true });
   fs.writeFileSync(path.join(media, 'EP01_K02_I0.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
@@ -143,7 +164,7 @@ async function main() {
     { id: 'fake', provider: 'openai-compatible', model: 'fake-a', apiBase: `http://127.0.0.1:${llm.port}/v1` },
     { id: 'fake2', provider: 'openai-compatible', model: 'fake-b', apiBase: `http://127.0.0.1:${llm.port}/v1`, price: { input: 1, output: 2 } },
   ];
-  V.settingsStore['aiFilmStudio.stepModels'] = { 'chia-canh': 'fake', 'ket-thuc-phien': 'fake', 'kich-ban-tap': 'fake' };
+  V.settingsStore['aiFilmStudio.stepModels'] = { 'chia-canh': 'fake', 'kich-ban-tap': 'fake', 'chia-tap': 'fake', 'dan-y-cac-tap': 'fake', 'dan-y': 'fake', chat: 'fake' };
 
   const ext = require('../src/extension');
   const ctx = V.fakeContext(TOOL);
@@ -198,6 +219,26 @@ async function main() {
   const kCanh = fs.readdirSync(path.join(root, '04_PRODUCTION/EPISODES/EP01/phan-doan')).find((d) => d.startsWith('K_'))!;
   const kFile = path.join(root, '04_PRODUCTION/EPISODES/EP01/phan-doan', kCanh, 'K_canh.md');
   ok(fs.readFileSync(kFile, 'utf8').includes('fake-a đã sửa'), 'Nhận → ghi K_canh.md');
+  let kNew: RegExpExecArray | null = null;
+  await waitFor(() => (kNew = /\*\*(K\d\d)\*\* \| 6 \| cảnh thử mới/.exec(fs.readFileSync(kFile, 'utf8'))) && !/\| MỚI \|/.test(fs.readFileSync(kFile, 'utf8')), 'cảnh MỚI của AI → tool cấp mã', 8000);
+  ok(/CHU-THICH-MA|\(toàn\)|\(cận/.test(fs.readFileSync(kFile, 'utf8')), `Nhận → tool tự chạy chú thích mã (mã mới ${(kNew as any)?.[1]})`);
+  ok((step.$('#actions [data-cmd="run"]')?.textContent ?? '').startsWith('✨'), 'nút chạy AI có dấu ✨');
+
+  console.log('\n[3b] Khung chat cuối trang');
+  await waitFor(() => step.$('#chatBox') && (step.$('#chatModel') as HTMLSelectElement).options.length >= 2, 'khung chat + chọn model');
+  (step.$('#chatModel') as HTMLSelectElement).value = 'fake';
+  (step.$('#chatText') as HTMLTextAreaElement).value = 'Phân đoạn này có mấy cảnh?';
+  (step.$('#chatSend') as HTMLElement).click();
+  await step.settle(20);
+  await waitFor(() => /Phân đoạn này có mấy cảnh/.test(step.$('#chatLog')!.textContent ?? '') && /OK/.test(step.$('#chatLog')!.textContent ?? ''), 'gửi → log có câu hỏi + trả lời (markdown)');
+  const cp = String(lastRequest?.messages?.[1]?.content ?? '');
+  ok(/## Trang đang mở/.test(cp) && /K_canh\.md/.test(cp) && /④|⑥|Phân cảnh/.test(cp), 'AI nhận sẵn ngữ cảnh trang (đối tượng, bước, file liên quan)');
+  (step.$('#chatCopy') as HTMLElement).click();
+  await step.settle();
+  ok(/Phân đoạn này có mấy cảnh/.test(V.clipboard.text ?? ''), 'Copy → clipboard có toàn bộ log');
+  (step.$('#chatClear') as HTMLElement).click();
+  await step.settle();
+  await waitFor(() => /Chưa có trao đổi/.test(step.$('#chatLog')!.textContent ?? ''), 'Clear → log trống');
 
   console.log('\n[4] So sánh 2 model');
   const cmp = step.$('#cmp') as HTMLSelectElement;
@@ -286,22 +327,6 @@ async function main() {
   (pf.$('#editor [data-copy]') as HTMLElement).click();
   await pf.settle();
   ok(/^Thực hiện video/.test(V.clipboard.text ?? ''), `📋 chép → clipboard: ${(V.clipboard.text ?? '').slice(0, 40)}`);
-
-  console.log('\n[8] Kết thúc phiên');
-  await V.commands.executeCommand('aiFilmStudio.endSession');
-  const es = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
-  await es.settle();
-  await waitFor(() => es.$('#files')!.textContent!.includes('git diff'), 'đầu vào ảo git diff');
-  (es.$('#actions [data-cmd="run"]') as HTMLElement).click();
-  await es.settle(20);
-  await waitFor(() => es.$('#runs [data-cmd="apply"]'), 'nháp nhật ký xong');
-  (es.$('#runs [data-cmd="apply"]') as HTMLElement).click();
-  await es.settle();
-  const stateMd = fs.readFileSync(path.join(root, '00_PROJECT/STATE.md'), 'utf8');
-  const iLog = stateMd.indexOf('## Nhật ký phiên');
-  const iNew = stateMd.indexOf('### Phiên 999');
-  const iOld = stateMd.indexOf('### Phiên', iLog);
-  ok(iNew > iLog && iNew === iOld, 'chèn mục mới ngay đầu "Nhật ký phiên"');
 
   console.log('\n[9] Lệnh quản lý');
   V.answers.push({ kind: 'info', value: 'Ghi' });
@@ -415,14 +440,20 @@ async function main() {
   ok(/J02[^\n]*👀 chờ duyệt/.test(fs.readFileSync(jFile, 'utf8')), 'bỏ duyệt → 👀 chờ duyệt');
 
   console.log('\n[13] Trạng thái · Tài nguyên · Ý tưởng – phong cách · danh sách tập');
-  const r0 = tree.getChildren().slice(0, 3).map((n: any) => tree.getTreeItem(n).label);
-  ok(r0.join(' | ') === 'Trạng thái dự án | Tài nguyên dự án | Ý tưởng – phong cách', `gốc cây: ${r0.join(' | ')}`);
-  const resNode = tree.getChildren()[1];
+  const r0 = tree.getChildren().slice(0, 4).map((n: any) => tree.getTreeItem(n).label);
+  ok(r0.join(' | ') === 'Trạng thái dự án | Tài liệu hướng dẫn | Tài nguyên dự án | Ý tưởng – phong cách', `gốc cây: ${r0.join(' | ')}`);
+  const top = tree.getChildren();
+  ok(top[0].kind === 'dashboard' && top[1].kind === 'guides' && tree.getTreeItem(top[1]).label === 'Tài liệu hướng dẫn', 'khung trái: 📖 Tài liệu hướng dẫn ngay dưới Trạng thái dự án');
+  const gGroups = tree.getChildren(top[1]);
+  const gFiles = gGroups.flatMap((g: any) => tree.getChildren(g)).flatMap((n: any) => (n.kind === 'resDir' ? tree.getChildren(n) : [n]));
+  for (const n of [...gGroups, ...gFiles]) tree.getTreeItem(n);
+  ok(gGroups.length >= 5 && gFiles.some((n: any) => /từng bước/.test(n.file.label)) && gFiles.every((n: any) => n.file.exists || n.file.rel.includes('tools/studio')), `Hướng dẫn: ${gGroups.length} nhóm · ${gFiles.length} file, đủ file`);
+  const resNode = top.find((n: any) => n.kind === 'resources')!;
   const groups = tree.getChildren(resNode);
   const resFiles = groups.flatMap((g: any) => tree.getChildren(g)).flatMap((n: any) => (n.kind === 'resDir' ? tree.getChildren(n) : [n]));
   for (const n of [...groups, ...resFiles]) tree.getTreeItem(n);
   ok(groups.length >= 5 && resFiles.some((n: any) => /đối chiếu sử liệu/.test(n.file.label)), `Tài nguyên: ${groups.length} nhóm · ${resFiles.length} file`);
-  V.commands.executeCommand('aiFilmStudio.openTarget', tree.getChildren()[2]);
+  V.commands.executeCommand('aiFilmStudio.openTarget', tree.getChildren().find((n: any) => n.kind === 'project'));
   await sleep(50);
   for (const p of V.panels) await p.settle();
   const pp = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step' && !p.disposed).find((p) => p.$('[data-step="y-tuong"]'))!;
@@ -438,12 +469,37 @@ async function main() {
   ok(/## Thể loại\s+Phim giả tưởng/.test(fs.readFileSync(path.join(root, '00_PROJECT/Y-TUONG_PHONG-CACH.md'), 'utf8')), 'lưu form → file ý tưởng đổi thể loại');
   (pp.$('[data-step="chia-tap"]') as HTMLElement).click();
   await pp.settle();
-  await waitFor(() => pp.$('#synText') && pp.$$('#epList tr').length > 18, `② kịch bản tóm tắt + bảng ${pp.$$('#epList tr').length - 1} tập`);
+  await waitFor(() => pp.$('#synText') && !pp.$('#gridHost')!.hidden && pp.$$('#gridHost #grid tr').length > 15, `② kịch bản tóm tắt + lưới ${pp.$$('#gridHost #grid tr').length - 1} tập ngay trong tab`);
   ok(/Chia tập/.test(pp.$('#editor [data-cmd="run"]')?.textContent ?? ''), 'nút ✨ Chia tập');
+  const gh = pp.$('#gridHost')!;
+  const hdr = Array.from(gh.querySelectorAll('#grid tr')[0].querySelectorAll('th')).map((x) => x.textContent ?? '');
+  ok(hdr.includes('Tóm tắt') && hdr.includes('Lịch'), `cột lưới: ${hdr.filter(Boolean).join(' · ')}`);
+  const si = hdr.indexOf('Trạng thái') - 1;
+  const rowOf = (code: string) => Array.from(gh.querySelectorAll('#grid tr')).find((tr) => (tr.querySelector('input[data-c="0"]') as HTMLInputElement | null)?.value === `**${code}**`)!;
+  const st11 = rowOf('EP11').querySelector(`select[data-c="${si}"]`) as HTMLSelectElement;
+  ok(Array.from(st11.options).map((o) => o.textContent).join(' · ') === '✅ Duyệt · ⬜ Chưa duyệt · ❌ Bỏ', `trạng thái 3 lựa chọn: ${Array.from(st11.options).map((o) => o.textContent).join(' · ')}`);
+  st11.value = '❌';
+  st11.dispatchEvent(new pp.dom!.window.Event('change', { bubbles: true }));
+  await pp.settle();
+  ok(!!rowOf('EP11').querySelector('[data-a="del"]') && !!rowOf('EP11').querySelector(`select[data-c="${si}"]`), 'tập ❌ có nút 🗑 và vẫn đổi lại trạng thái được');
+  (gh.querySelector('#gSave') as HTMLElement).click();
+  await pp.settle(10);
+  ok(/\*\*EP11\*\* \| — \|.*\| ❌ \|/.test(fs.readFileSync(path.join(root, '04_PRODUCTION/DANH-SACH-TAP.md'), 'utf8')), 'lưu lưới → EP11 ❌, không số phát hành');
+  (pp.$('#editor [data-cmd="run"]') as HTMLElement).click();
+  await pp.settle(20);
+  await waitFor(() => pp.$('#runs [data-cmd="apply"]'), 'Chia tập: AI đề xuất xong');
+  (pp.$('#runs [data-cmd="apply"]') as HTMLElement).click();
+  await pp.settle(10);
+  const ds = fs.readFileSync(path.join(root, '04_PRODUCTION/DANH-SACH-TAP.md'), 'utf8');
+  ok(!/\*\*EP11\*\*/.test(ds), 'Nhận → tập ❌ EP11 bị xóa khỏi danh sách');
+  ok(/LỜI CHA GIÀ NƠI BIÊN ẢI/.test(ds) && !/AI ĐỔI TÊN/.test(ds), 'tập ✅ giữ nguyên văn dù AI sửa');
+  const nm = /\*\*(EP\d+)\*\* \| (TAP\d+) \| TẬP MỚI THỬ \|/.exec(ds);
+  ok(!!nm && nm[1] !== 'EP11' && nm[1] > 'EP16', `tập MỚI được cấp mã ${nm?.[1]} (không dùng lại EP11) · ${nm?.[2]}`);
+  await waitFor(() => !!rowOf(nm?.[1] ?? '?'), 'lưới trong tab tải lại sau khi Nhận');
   await V.commands.executeCommand('aiFilmStudio.editEpisodeList');
   const eg = V.panels.filter((p) => p.viewType === 'aiFilmStudio.grid').pop()!;
   await eg.settle();
-  await waitFor(() => eg.$$('#grid tr').length > 18, `lưới danh sách tập: ${eg.$$('#grid tr').length - 1} dòng`);
+  await waitFor(() => eg.$$('#grid tr').length > 15, `lưới danh sách tập: ${eg.$$('#grid tr').length - 1} dòng`);
   const relCol = (r: number) => (eg.$$('#grid tr')[r + 1].querySelectorAll('input')[1] as HTMLInputElement).value;
   ok(relCol(0) === 'TAP00', `teaser EP00 cố định: ${relCol(0)}`);
   (eg.$('[data-a="down"][data-r="1"]') as HTMLElement).click();
@@ -452,16 +508,55 @@ async function main() {
   (eg.$('[data-a="add"][data-r="2"]') as HTMLElement).click();
   await eg.settle(10);
   const epNew = (eg.$$('#grid tr')[4].querySelectorAll('input')[0] as HTMLInputElement).value;
-  ok(epNew === '**EP21**', `thêm tập → mã kế tiếp chưa dùng: ${epNew}`);
-  ok(eg.$$('[data-a="mkdir"]').length === 0, 'tập mới chưa lưu chưa có nút 📁');
+  ok(/^\*\*EP\d+\*\*$/.test(epNew) && epNew !== `**${nm?.[1]}**`, `thêm tập → mã kế tiếp chưa dùng: ${epNew}`);
+  ok(eg.$$('[data-a="mkdir"]').length === 1, 'tập mới chưa lưu chưa có nút 📁 (chỉ tập MỚI của AI đã lưu có)');
   (eg.$('[data-a="merge"][data-r="3"]') as HTMLElement).click();
   await eg.settle();
   ok(relCol(3) === '↑ TAP02' && relCol(4) === 'TAP03', `⤴ gộp EP21 vào tập phát hành dòng trên: ${relCol(3)} · dòng sau ${relCol(4)}`);
   (eg.$('#gSave') as HTMLElement).click();
   await eg.settle(10);
   const listTxt = fs.readFileSync(path.join(root, '04_PRODUCTION/DANH-SACH-TAP.md'), 'utf8');
-  ok(/\*\*EP02\*\* \| TAP01/.test(listTxt) && /\*\*EP21\*\* \| ↑ TAP02/.test(listTxt) && /\*\*EP01\*\* \| TAP02/.test(listTxt), 'lưu → file có EP02=TAP01, EP01=TAP02, EP21=↑ TAP02');
-  await waitFor(() => eg.$$('[data-a="mkdir"]').length === 1, 'sau khi lưu: EP21 có nút 📁 tạo thư mục');
+  ok(/\*\*EP02\*\* \| TAP01/.test(listTxt) && listTxt.includes(`${epNew} | ↑ TAP02`) && /\*\*EP01\*\* \| TAP02/.test(listTxt), `lưu → file có EP02=TAP01, EP01=TAP02, ${epNew}=↑ TAP02`);
+  await waitFor(() => eg.$$('[data-a="mkdir"]').length === 2, `sau khi lưu: ${epNew} có nút 📁 tạo thư mục`);
+
+  console.log('\n[13b] Dự án: ③ Dàn ý mọi tập — chọn tập, sửa, duyệt');
+  ok(!pp.$('[data-step="ket-thuc-phien"]'), 'không còn bước Kết thúc phiên');
+  (pp.$('[data-step="dan-y-cac-tap"]') as HTMLElement).click();
+  await pp.settle();
+  await waitFor(() => pp.$$('#olList .olRow').length > 15 && pp.$('#olAllText'), `③ bảng dàn ý ${pp.$$('#olList .olRow').length} tập + ô sửa`);
+  (pp.$('#olList .olRow[data-ep="EP03"]') as HTMLElement).click();
+  await pp.settle();
+  await waitFor(() => (pp.$('#olAllText') as HTMLTextAreaElement)?.dataset.ep === 'EP03', 'chọn EP03 → hiện dàn ý EP03');
+  ok(/Lê Lợi/.test((pp.$('#olAllText') as HTMLTextAreaElement).value), 'dàn ý EP03 có nội dung');
+  const olT = pp.$('#olAllText') as HTMLTextAreaElement;
+  olT.value += '\n- ý thêm ở tab dự án';
+  olT.dispatchEvent(new pp.dom!.window.Event('input', { bubbles: true }));
+  (pp.$('#olList .olRow[data-ep="EP04"]') as HTMLElement).click();
+  await pp.settle();
+  ok(/đang sửa dở/.test(pp.$('#olWarn')!.textContent ?? '') && (pp.$('#olAllText') as HTMLTextAreaElement).dataset.ep === 'EP03', 'sửa dở → không cho chuyển tập');
+  (pp.$('#olAllAppr') as HTMLElement).click();
+  await pp.settle(10);
+  const ol3 = fs.readFileSync(path.join(root, '04_PRODUCTION/EPISODES/EP03/dan-y.md'), 'utf8');
+  ok(/^<!-- @tool dan-y: ✅/.test(ol3) && /ý thêm ở tab dự án/.test(ol3), 'Duyệt → lưu nội dung + dòng trạng thái ✅ đầu file');
+  await waitFor(() => /đã duyệt/.test(pp.$('#olList .olRow[data-ep="EP03"]')?.textContent ?? '') && pp.$('#olAllUndo'), 'bảng: EP03 ✅ đã duyệt · nút Bỏ duyệt');
+  ok(!/dan-y:/.test((pp.$('#olAllText') as HTMLTextAreaElement).value), 'ô sửa không hiện dòng trạng thái');
+
+  // Gợi ý dàn ý: chọn EP04 (chưa duyệt) → ✨ → chọn "Chỉ EP04" → thẻ kết quả EP04 → Nhận ghi vào EP04/dan-y.md
+  (pp.$('#olList .olRow[data-ep="EP04"]') as HTMLElement).click();
+  await pp.settle();
+  await waitFor(() => (pp.$('#olAllText') as HTMLTextAreaElement)?.dataset.ep === 'EP04', 'chọn EP04');
+  ok(/Gợi ý dàn ý/.test(pp.$('#actions [data-cmd="run"]')?.textContent ?? ''), 'nút ✨ Gợi ý dàn ý ở ③ tab dự án');
+  V.answers.push({ kind: 'info', value: 'Chỉ EP04' });
+  (pp.$('#actions [data-cmd="run"]') as HTMLElement).click();
+  await pp.settle(20);
+  await waitFor(() => /EP04/.test(pp.$('#runs .card')?.textContent ?? '') && pp.$('#runs [data-cmd="apply"]'), 'thẻ kết quả ghi mã tập EP04, có Nhận');
+  ok(/# ③ GỢI Ý DÀN Ý — tập EP04/.test(String(lastRequest?.messages?.[1]?.content ?? '')), 'prompt gửi đi là gợi ý dàn ý của EP04');
+  ok(/khung mỗi tập là \*\*15–20 phút\*\*/.test(String(lastRequest?.messages?.[1]?.content ?? '')), 'prompt có thời lượng mỗi tập lấy từ form ① ({{thoiLuong}})');
+  (pp.$('#runs [data-cmd="apply"]') as HTMLElement).click();
+  await pp.settle(10);
+  ok(/đã sửa/.test(fs.readFileSync(path.join(root, '04_PRODUCTION/EPISODES/EP04/dan-y.md'), 'utf8')), 'Nhận → ghi vào EP04/dan-y.md (đúng tập, không phải file của tab dự án)');
+  (pp.$('#olList .olRow[data-ep="EP03"]') as HTMLElement).click();
+  await pp.settle();
 
   console.log('\n[14] Tập: ③ Dàn ý → Tạo phân đoạn → ④ duyệt từng phân đoạn → Phân cảnh');
   const e3 = tree.getChildren().find((n: any) => n.kind === 'episode' && n.ep.id === 'EP03');
@@ -477,6 +572,7 @@ async function main() {
   (t3.$('#olNext') as HTMLElement).click();
   await t3.settle(10);
   ok(/thêm một ý thử/.test(fs.readFileSync(path.join(root, '04_PRODUCTION/EPISODES/EP03/dan-y.md'), 'utf8')), 'Tạo phân đoạn → lưu dàn ý');
+  ok(/^<!-- @tool dan-y: ✅/.test(fs.readFileSync(path.join(root, '04_PRODUCTION/EPISODES/EP03/dan-y.md'), 'utf8')), 'lưu ở tab tập vẫn giữ trạng thái ✅ dàn ý');
   await waitFor(() => t3.$('#stepper .st.cur')?.dataset.step === 'kich-ban-tap' && t3.$('#runs [data-cmd="apply"]'), 'tự sang ④ + AI chạy xong');
   (t3.$('#runs [data-cmd="apply"]') as HTMLElement).click();
   await t3.settle(10);

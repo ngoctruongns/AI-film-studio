@@ -1,3 +1,4 @@
+import { ChatController } from './ui/chat';
 import * as vscode from 'vscode';
 import { Scope } from './core/config';
 import { StepTarget } from './core/context';
@@ -14,6 +15,7 @@ import { NotesTree, ProjectNode, ProjectTree, nodeTarget } from './ui/trees';
 export function activate(context: vscode.ExtensionContext): void {
   const studio = new Studio(context);
   const models = new ModelRegistry(studio, context.secrets);
+  ChatController.models = models;              // khung chat cuối mỗi trang dùng chung registry
   const diagnostics = vscode.languages.createDiagnosticCollection('ai-film-studio');
   context.subscriptions.push(studio, diagnostics);
 
@@ -104,12 +106,6 @@ export function activate(context: vscode.ExtensionContext): void {
   reg('aiFilmStudio.blenderPing', async () => {
     const out = await blenderSocket(studio, "import bpy\nprint('AFS_OK:' + bpy.app.version_string + ' | ' + (bpy.data.filepath or '(chưa lưu)'))");
     return /AFS_OK:(.*)/.exec(out)?.[1]?.trim() ?? out.trim();
-  });
-  reg('aiFilmStudio.endSession', () => {
-    if (!studio.config?.pipeline.steps.some((s) => s.id === 'ket-thuc-phien')) {
-      return vscode.window.showWarningMessage('pipeline.yaml chưa có bước "ket-thuc-phien".');
-    }
-    openStep('ket-thuc-phien', {});
   });
   reg('aiFilmStudio.setApiKey', () => SettingsPanel.show(studio, models));
   reg('aiFilmStudio.testModel', () => SettingsPanel.show(studio, models));

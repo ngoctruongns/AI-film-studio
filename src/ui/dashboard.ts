@@ -1,7 +1,9 @@
 // Tab Trạng thái dự án: tiến độ các tập, ma trận phân đoạn × bước của tập đang chọn, thời lượng, lịch phát hành, chi phí AI.
+import { CHAT_BODY, CHAT_JS, ChatController } from './chat';
 import * as fs from 'fs';
 import { attemptStats } from '../core/attempts';
 import * as vscode from 'vscode';
+import { episodeDuration } from '../core/idea';
 import { STATUS_LABEL, STATUS_ORDER, StatusKey, statusSymbol } from '../core/config';
 import { findSection, formatDuration, parseHeadings } from '../core/markdown';
 import { readRuns, summarizeCost } from '../core/runs';
@@ -31,6 +33,7 @@ export class Dashboard {
       retainContextWhenHidden: true,
     });
     this.panel = panel;
+    const chat = new ChatController(studio, 'trang-thai-du-an', (m) => panel.webview.postMessage(m), () => this.chatContext(studio));
     const render = () => (panel.webview.html = this.html(studio, panel.webview));
     const sub = studio.onDidChange(render);
     panel.onDidDispose(() => {
@@ -38,6 +41,7 @@ export class Dashboard {
       this.panel = undefined;
     });
     panel.webview.onDidReceiveMessage(async (m) => {
+      if (m.__chat) return chat.onMessage(m);
       if (m.type === 'open') return handleOpen(m);
       if (m.type === 'cmd' && m.cmd === 'episode') {
         this.selected = m.arg;
@@ -47,7 +51,6 @@ export class Dashboard {
       if (m.type === 'cmd' && m.cmd === 'refresh') studio.refresh();
       if (m.type === 'cmd' && m.cmd === 'blender') vscode.commands.executeCommand('aiFilmStudio.openBlender', { ep: m.arg });
       if (m.type === 'cmd' && m.cmd === 'settings') vscode.commands.executeCommand('aiFilmStudio.openSettings');
-      if (m.type === 'cmd' && m.cmd === 'endSession') vscode.commands.executeCommand('aiFilmStudio.endSession');
       if (m.type === 'cmd' && m.cmd === 'grid') vscode.commands.executeCommand('aiFilmStudio.editSceneTable', JSON.parse(m.arg));
     });
     render();
@@ -58,7 +61,7 @@ export class Dashboard {
     if (!model) return shell(webview, 'Trạng thái dự án', `<h1>AI Film Studio</h1><p class="err">${esc(studio.error ?? 'Chưa nạp dự án')}</p>`);
     const p = model.config.project;
     const st = p.status;
-    const cap = p.episodeCapSeconds;
+    const cap = episodeDuration(model.config.root, p.idea, p.episodeCapSeconds).max;
     const now = new Date();
     const live = model.episodes.filter((e) => !e.legacy);
     const sel = model.episodes.find((e) => e.id === this.selected) ?? live[0];
@@ -154,12 +157,28 @@ export class Dashboard {
       'Trạng thái dự án',
       `<div class="row" style="justify-content:space-between"><h1>${esc(p.name)}</h1>
         <span class="muted">quét lúc ${model.scannedAt.toLocaleTimeString('vi-VN')} <button class="link" data-cmd="refresh">quét lại</button>
-        <button class="link" data-cmd="settings">cài đặt AI</button><button class="link" data-cmd="endSession">kết thúc phiên</button></span></div>
+        <button class="link" data-cmd="settings">cài đặt AI</button></span></div>
       ${tiles}
       ${logHtml}
       <h2>Các tập</h2>${epTable}
-      ${sel ? this.episodeDetail(studio, sel) : ''}`,
+      ${sel ? this.episodeDetail(studio, sel) : ''}${CHAT_BODY}`,
+      CHAT_JS,
     );
+  }
+
+  /** ngữ cảnh khung chat: số liệu từng tập + phân đoạn của tập đang chọn */
+  private static chatContext(studio: Studio): { label: string; text: string } {
+    const model = studio.model;
+    if (!model) return { label: 'Trạng thái dự án', text: '' };
+    const dur = episodeDuration(model.config.root, model.config.project.idea, model.config.project.episodeCapSeconds);
+    const rows = model.episodes.map((e) => {
+      const segs = e.segments.filter((s) => !s.dropped);
+      const sc = segs.flatMap((s) => s.scenes).filter((c) => c.status !== 'dropped');
+      return `- ${e.release ?? e.id} (${e.id}) ${e.title ?? ''}${e.legacy ? ' · cấu trúc cũ' : ''} · ${segs.length} phân đoạn · ${sc.length} cảnh (✅ ${sc.filter((c) => c.status === 'done').length}) · ${formatDuration(e.sceneSeconds)}`;
+    });
+    const sel = model.episodes.find((e) => e.id === this.selected);
+    const detail = sel ? `\n### Tập đang chọn ${sel.id}\n${sel.segments.map((s) => `- [${s.code}] ${s.name} · ${s.statusText ?? ''} · ${s.scenes.length} cảnh`).join('\n')}` : '';
+    return { label: 'Trạng thái dự án', text: `- Dự án: ${model.config.project.name} · khung thời lượng tập: ${dur.text || '?'}\n### Các tập\n${rows.join('\n')}${detail}` };
   }
 
   private static episodeDetail(studio: Studio, ep: Episode): string {

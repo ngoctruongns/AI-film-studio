@@ -6,6 +6,7 @@ import { FileRef, STUDIO_DIR, StatusKey, StepSpec, STATUS_LABEL, parseStatus } f
 import { applySelect, columnIndex, findSection, findTable, replaceSection, stripMd } from './markdown';
 import { scanBlender } from './blender';
 import { readRuns } from './runs';
+import { ideaVars } from './idea';
 import { Placeholders, ProjectModel, fill, findEpisode, findScene, findSegment, placeholdersFor } from './scanner';
 
 export interface StepTarget {
@@ -170,7 +171,7 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 2.4);
 }
 
-function coreContext(model: ProjectModel): string {
+export function coreContext(model: ProjectModel): string {
   const parts: string[] = [];
   for (const ref of model.config.project.coreContext ?? []) {
     const r = resolveRef(model, ref, { root: model.config.root }, 'input');
@@ -199,6 +200,8 @@ export function buildPrompt(model: ProjectModel, rs: ResolvedStep, request: stri
     output: out ? out.label : '(không ghi file)',
     current,
     request: request.trim() || '(không có yêu cầu thêm)',
+    // ô có key của form ① (vd. {{thoiLuong}}) — trống thì báo AI hỏi tác giả
+    ...Object.fromEntries(Object.entries(ideaVars(model.config.root, model.config.project.idea)).map(([k, v]) => [k, v || '(chưa đặt ở ① Ý tưởng + phong cách — hỏi tác giả bằng @T)'])),
     ...Object.fromEntries(Object.entries(rs.ph).filter(([, v]) => v !== undefined)),
   } as Record<string, string>;
   const body = tpl.replace(/\{\{(\w+)\}\}/g, (all, k) => vars[k] ?? all);

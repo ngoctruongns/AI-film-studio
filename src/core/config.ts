@@ -94,6 +94,8 @@ export interface ProjectConfig {
   };
   /** Tài nguyên dự án — tài liệu dùng chung, gom theo nhóm — core/resources.ts */
   resources?: ResourceGroup[];
+  /** 📖 Tài liệu hướng dẫn — cho NGƯỜI dùng (tool, quy trình, Blender, Dreamina, KdenLive…), cùng dạng nhóm với resources */
+  guides?: ResourceGroup[];
   /** bước ①: form ý tưởng + phong cách — core/idea.ts */
   idea?: IdeaConfig;
   /** bước ②: file kịch bản tóm tắt cả phim (sửa trong tab) */
@@ -152,12 +154,12 @@ export interface StepSpec {
    *  idea = form ý tưởng + phong cách · synopsis = sửa kịch bản tóm tắt + danh sách tập ·
    *  outline = sửa dàn ý tập (file đầu vào thứ nhất) · section = sửa mục đầu ra (kịch bản phân đoạn) · lines = lưới bảng lời trong tab ·
    *  prompts = prompt cảnh + ảnh dùng chung, nút chép · render = key frame / clip render + ảnh render của cảnh · segments = bảng phân đoạn của tập: duyệt từng dòng + "Phân cảnh" */
-  view?: ('media' | 'grid' | 'lines' | 'idea' | 'synopsis' | 'outline' | 'segments' | 'section' | 'prompts' | 'render')[];
+  view?: ('media' | 'grid' | 'lines' | 'idea' | 'synopsis' | 'outline' | 'outlines' | 'segments' | 'section' | 'prompts' | 'render')[];
   /** nút chuyển sang bước sau và chạy AI luôn, vd. ③ Dàn ý → "Tạo phân đoạn" → ④ */
   next?: { step: string; label: string };
   /** AI chỉ tạo lại cái CHƯA duyệt: sau khi AI trả bản đề xuất, tool khôi phục nguyên văn phần đã duyệt (core/protect.ts).
    *  scenes / lines / episodes = dòng bảng · segments = mục ## [X] · segment / scene = cả bước khóa khi đối tượng đã duyệt */
-  protect?: 'scenes' | 'lines' | 'episodes' | 'segments' | 'segment' | 'scene';
+  protect?: 'scenes' | 'lines' | 'episodes' | 'segments' | 'segment' | 'scene' | 'outline';
   /** chữ trên nút chạy AI (mặc định "Chạy"), vd. "Chia tập" */
   runLabel?: string;
   gate?: StepGate;
