@@ -1,10 +1,12 @@
-// Tab 🧊 Blender của một tập: file .blend · script dựng · hướng dẫn · shot (marker) → frame → cảnh · quét từ Blender · ghi sổ SO-BLENDER.md.
+// Tab 🧊 Blender của một tập: file .blend · script dựng · hướng dẫn · shot (marker) → frame → cảnh · quét từ Blender · ghi sổ SO-BLENDER.md
+// · render tham chiếu ở máy này (bảng từ "<blender.refRender> <tập> --ds", nút ▶ gõ lệnh render vào terminal).
 import { CHAT_BODY, CHAT_JS, ChatController } from './chat';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { BlenderModel, DUMP_PY, gotoShotPy, parseDump, renderCommandFor, renderRegister, saveIndex, scanBlender } from '../core/blender';
 import { runBlenderCli, runInBlenderSocket } from '../core/blenderLink';
+import { RefList, listRefs, pythonCommand, recheck, refCommand } from '../core/refRender';
 import { listSceneMedia } from '../core/results';
 import { runsDir } from '../core/runs';
 import { Episode, episodeLabel, fill, findEpisode, placeholdersFor } from '../core/scanner';
@@ -52,12 +54,17 @@ export class BlenderPanel {
     this.panels.set(ep, p);
     panel.onDidDispose(() => {
       p.sub.dispose();
+      clearInterval(p.timer);
       this.panels.delete(ep);
     });
   }
 
   private sub: vscode.Disposable;
   private chat: ChatController;
+  private refs?: RefList;
+  private refErr?: string;
+  /** render chạy ở terminal → dò đĩa định kỳ, file mới ra thì bảng tự đổi ✅ */
+  private timer: NodeJS.Timeout;
 
   private constructor(
     readonly panel: vscode.WebviewPanel,
@@ -86,6 +93,40 @@ export class BlenderPanel {
       }),
     );
     panel.webview.html = shell(panel.webview, 'Blender', BODY + CHAT_BODY, CLIENT_JS + CHAT_JS);
+    this.timer = setInterval(() => {
+      if (this.panel.visible && this.refs && recheck(this.refs)) this.post();
+    }, 4000);
+  }
+
+  private python(): string {
+    return pythonCommand(this.studio.settings.get<string>('pythonPath'));
+  }
+
+  private async loadRefs(): Promise<void> {
+    const script = this.bm?.cfg.refRender;
+    if (!script || !this.studio.root) return;
+    this.refErr = undefined;
+    try {
+      this.refs = await listRefs(this.python(), script, this.epId, this.studio.root);
+    } catch (e: any) {
+      this.refs = undefined;
+      this.refErr = e.message ?? String(e);
+    }
+    this.post();
+  }
+
+  /** arg = "chi|phan|cờ" — cờ: l = render lại cả file đã có, n = chỉ in sẽ chạy gì */
+  private runRef(arg: string): void {
+    const script = this.bm?.cfg.refRender;
+    if (!script) return;
+    const [chi, phan, co = ''] = arg.split('|');
+    const blender = blenderSettings(this.studio).path;
+    const cmd = refCommand({ python: this.python(), script, ep: this.epId, chi, phan, lai: co.includes('l'), dryRun: co.includes('n'), blender });
+    const name = `Render tham chiếu · ${this.epId}`;
+    const term = vscode.window.terminals?.find((t) => t.name === name && !t.exitStatus) ?? vscode.window.createTerminal({ name, cwd: this.studio.root });
+    term.show();
+    term.sendText(cmd);
+    this.status(`▶ ${cmd}`);
   }
 
   private ep(): Episode | undefined {
@@ -140,6 +181,9 @@ export class BlenderPanel {
         };
       }),
       issues: bm.issues,
+      ref: bm.cfg.refRender
+        ? { script: bm.cfg.refRender, list: this.refs, error: this.refErr, python: this.python(), sceneTitles: Object.fromEntries([...scenes].map(([k, v]) => [k, v.c.title])) }
+        : undefined,
     };
   }
 
@@ -152,8 +196,10 @@ export class BlenderPanel {
     const model = this.studio.model;
     switch (m.type) {
       case 'ready':
-        return this.post();
+        this.post();
+        return this.loadRefs();
       case 'open':
+        if (m.path && /\.(png|jpe?g|webp|mp4|mov)$/i.test(m.path) && fs.existsSync(m.path)) return void vscode.commands.executeCommand('vscode.open', vscode.Uri.file(m.path), vscode.ViewColumn.Beside);
         if (m.path && fs.existsSync(m.path)) {
           const doc = await vscode.workspace.openTextDocument(m.path);
           const pos = new vscode.Position(Number(m.line ?? 0), 0);
@@ -245,6 +291,17 @@ export class BlenderPanel {
       }
       case 'writeRegister':
         return this.writeRegister();
+      case 'refRender':
+        return this.runRef(String(m.arg ?? ''));
+      case 'refReload':
+        this.status('⏳ đọc sổ render…');
+        await this.loadRefs();
+        return this.status(this.refErr ? `❌ ${this.refErr}` : `✅ sổ render: ${this.refs?.ds.length ?? 0} mục`);
+      case 'refOpenOut': {
+        const out = this.refs?.out;
+        if (!out || !fs.existsSync(out)) return void vscode.window.showInformationMessage(`Chưa có thư mục ra ${out ?? ''} — render một mục trước.`);
+        return void vscode.env.openExternal(vscode.Uri.file(out));
+      }
     }
   }
 
@@ -289,6 +346,17 @@ const BODY = `
 <div id="status" class="muted"></div>
 <div id="sub" class="muted"></div>
 <h2>File .blend</h2><div class="scroll-x" id="files"></div>
+<div id="refBox" hidden>
+<h2>Render tham chiếu <span class="muted">(máy này — theo sổ render của tập)</span></h2>
+<div class="row">
+  <button data-cmd="refRender" data-arg="||" title="render mọi mục trong sổ còn thiếu file ra (bỏ qua file đã có)">▶ Render mọi thứ còn thiếu</button>
+  <button class="sec" data-cmd="refRender" data-arg="||n" title="chỉ in danh sách sẽ render, không chạy Blender">Xem sẽ chạy gì</button>
+  <button class="link" data-cmd="refOpenOut">📂 thư mục ra</button><button class="link" data-cmd="refReload">đọc lại sổ</button>
+</div>
+<div class="row"><input id="rfilter" placeholder="lọc: F02, F02_R3, REF, linh_ho…" size="30"><label><input type="checkbox" id="rmissing"> chỉ cái còn thiếu</label><span id="rcount" class="muted"></span></div>
+<div id="rsub" class="muted"></div>
+<div class="scroll-x" id="refs" style="margin-top:6px"></div>
+</div>
 <h2>Shot ↔ cảnh <span class="muted">(thứ tự chiếu)</span></h2>
 <div class="row"><input id="filter" placeholder="lọc: F02, F, tran_da_bang…" size="30"><label><input type="checkbox" id="onlyIssues"> chỉ dòng có vấn đề</label><span id="count" class="muted"></span></div>
 <div class="scroll-x" id="shots" style="margin-top:6px"></div>
@@ -305,6 +373,8 @@ window.addEventListener('message', (e) => {
   if (m.type === 'status') $('status').textContent = m.text;
 });
 $('filter').addEventListener('input', () => vm && renderShots());
+$('rfilter').addEventListener('input', () => vm && renderRefs());
+$('rmissing').addEventListener('change', () => vm && renderRefs());
 $('onlyIssues').addEventListener('change', () => vm && renderShots());
 const kb = (n) => n === undefined ? '' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.round(n / 1e3) + ' kB';
 const base = (p) => String(p).split('/').pop();
@@ -327,6 +397,7 @@ function render() {
       + '<td>' + links(f.scripts, f.scriptsAbs) + '</td><td>' + links(f.guides, f.guidesAbs) + '</td><td>' + idx + '</td><td style="white-space:nowrap">' + act + '</td></tr>';
   }).join('') + '</table>';
   renderShots();
+  renderRefs();
   $('issues').innerHTML = vm.issues.length ? vm.issues.map((i) => '<div>' + (i.severity === 'warning' ? '⚠' : 'ℹ') + ' ' + esc(i.message) + '</div>').join('') : '<span class="ok">không có</span>';
 }
 function renderShots() {
@@ -348,9 +419,52 @@ function renderShots() {
       + '<td class="' + (warnSec ? 'err' : '') + '">' + s.seconds.toFixed(1) + ' s' + (s.sceneSeconds !== undefined ? ' <span class="muted">/ ' + s.sceneSeconds + '</span>' : '') + '</td>'
       + '<td>' + src + '</td><td>' + refs + (s.note ? '<div class="muted">' + esc(s.note) + '</div>' : '') + '</td>'
       + '<td style="white-space:nowrap"><button class="link" data-cmd="goto" data-arg="' + esc(s.file + '|' + s.code) + '" title="đặt preview range + camera trong Blender đang mở">xem trong Blender</button>'
-      + (s.render ? '<button class="link" data-cmd="copy" data-arg="' + esc(s.render) + '" title="' + esc(s.render) + '">chép lệnh render</button>' + (vm.blender.path ? '<button class="link" data-cmd="render" data-arg="' + esc(s.render) + '">render</button>' : '') : '') + '</td></tr>';
+      + (s.render ? '<button class="link" data-cmd="copy" data-arg="' + esc(s.render) + '" title="' + esc(s.render) + '">chép lệnh render</button>' + (vm.blender.path ? '<button class="link" data-cmd="render" data-arg="' + esc(s.render) + '" title="render thô cả khung hình của shot ra //render/ cạnh file .blend">render thô</button>' : '') : '')
+      + (vm.ref ? '<button class="link" data-cmd="refRender" data-arg="' + esc(s.scene + '|anh,clip,key,bang|') + '" title="render tham chiếu còn thiếu của cảnh ' + esc(s.scene) + ' theo sổ (key frame, clip _R1/_R2…, bảng 2×2)">▶ tham chiếu</button>' : '') + '</td></tr>';
   }).join('');
   $('shots').innerHTML = '<table><tr><th>Cảnh</th><th>Shot</th><th>File</th><th>Camera</th><th>Frame</th><th>Số frame</th><th>Giây / bảng</th><th>Nguồn</th><th>Clip tham chiếu / Ra</th><th></th></tr>' + rows + '</table>';
+}
+const LOAI = { sheet: 'character sheet', anh: 'ảnh tĩnh', key: 'key frame', clip: 'clip', bang: 'bảng 2×2' };
+function renderRefs() {
+  const r = vm.ref;
+  $('refBox').hidden = !r;
+  if (!r) return;
+  if (!r.list) {
+    $('refs').innerHTML = r.error ? '<span class="err">' + esc(r.error) + '</span><div class="muted">cần Python 3 (Cài đặt → Python) + script <code>' + esc(r.script) + '</code></div>' : '<span class="muted">⏳ đọc sổ…</span>';
+    $('rcount').textContent = '';
+    return;
+  }
+  const q = $('rfilter').value.trim().toLowerCase();
+  const miss = $('rmissing').checked;
+  const all = r.list.ds;
+  const list = all.filter((d) => (!q || (d.ma + ' ' + d.loai + ' ' + (d.file || '') + ' ' + LOAI[d.loai]).toLowerCase().includes(q)) && (!miss || !d.co));
+  $('rcount').textContent = all.filter((d) => d.co).length + ' / ' + all.length + ' đã có · đang hiện ' + list.length;
+  $('rsub').innerHTML = 'ra: <code>' + esc(r.list.out) + '</code> · python: <code>' + esc(r.python) + '</code> · Blender: <code>' + esc(vm.blender.path || 'tự tìm (PATH / Program Files)') + '</code>';
+  const groups = new Map();
+  for (const d of list) {
+    const g = d.loai === 'key' || d.loai === 'clip' ? d.canh : d.loai;
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(d);
+  }
+  const btn = (arg, label, title, cls) => '<button class="' + (cls || 'link') + '" data-cmd="refRender" data-arg="' + esc(arg) + '" title="' + esc(title) + '">' + label + '</button>';
+  let h = '<table><tr><th>Mã</th><th>Loại</th><th>File .blend</th><th>Frame</th><th>Ra</th><th></th></tr>';
+  for (const [g, ds] of groups) {
+    const thieu = ds.filter((d) => !d.co).length;
+    const scene = ds[0].loai === 'key' || ds[0].loai === 'clip';
+    const head = scene ? '<b>' + esc(g) + '</b> · ' + esc(r.sceneTitles[g] || '') : '<b>' + esc(LOAI[g] || g) + '</b>';
+    const arg = scene ? g + '|clip,key|' : '|' + g + '|';
+    h += '<tr><th colspan="6">' + head + ' <span class="muted">' + (ds.length - thieu) + '/' + ds.length + '</span> '
+      + (thieu ? btn(arg, '▶ render ' + thieu + ' còn thiếu', 'render mọi mục còn thiếu của nhóm này') : '<span class="ok">✓ đủ</span>') + '</th></tr>';
+    for (const d of ds) {
+      const ten = d.dich.split(/[\\\\/]/).pop();
+      const fr = d.frame ? (d.frame[0] === d.frame[1] ? d.frame[0] : d.frame[0] + ' – ' + d.frame[1]) : (d.o ? d.o.join(' · ') : (d.phan_doan || []).join(', '));
+      const ra = d.co ? '<a data-open="' + esc(d.dich) + '"><span class="ok">✓</span> ' + esc(ten) + '</a>' : '<span class="muted">— ' + esc(ten) + '</span>';
+      const one = d.ma + '|' + d.loai + '|';
+      h += '<tr><td><b>' + esc(d.ma) + '</b></td><td>' + esc(LOAI[d.loai] || d.loai) + '</td><td>' + esc(d.file || '') + '</td><td style="white-space:nowrap">' + esc(fr) + '</td><td>' + ra + '</td>'
+        + '<td style="white-space:nowrap">' + (d.co ? btn(one + 'l', '↻ render lại', 'render lại, ghi đè file đã có') : btn(one, '▶ render', 'render mục này')) + '</td></tr>';
+    }
+  }
+  $('refs').innerHTML = h + '</table>';
 }
 vscode.postMessage({ type: 'ready' });
 `;

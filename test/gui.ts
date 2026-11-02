@@ -379,6 +379,18 @@ async function main() {
   (shotRows().find((r) => r.children[1]?.textContent === 'F02')!.querySelector('[data-cmd="goto"]') as HTMLElement).click();
   await bp.settle(10);
   ok(blenderCodes.some((c) => c.includes('frame_preview_start = 140') && c.includes('CAM_F02')), 'xem trong Blender → preview range 140 + CAM_F02');
+  // bảng Render tham chiếu: danh sách từ render_tham_chieu.py --ds (python thật trên bản sao dự án)
+  await waitFor(() => bp.$$('#refs tr').length > 50, `bảng render tham chiếu: ${bp.$$('#refs tr').length} dòng · ${bp.$('#refs')!.textContent!.slice(0, 120)}`, 15000);
+  ok(bp.$('#refs')!.textContent!.includes('REF_THANH_DABANG_R1'), 'có ảnh tĩnh REF_THANH_DABANG_R1');
+  const r3 = bp.$$('#refs tr').find((r) => r.children[0]?.textContent === 'F02_R3')!;
+  ok(r3?.textContent!.includes('tran_da_bang_blockout.blend') && r3.textContent!.includes('70 – 227'), `F02_R3: ${r3?.textContent}`);
+  (r3.querySelector('[data-cmd="refRender"]') as HTMLElement).click();
+  await bp.settle(10);
+  const rt = V.terminals[V.terminals.length - 1];
+  ok(/^Render tham chiếu · EP01: python3? 04_PRODUCTION\/BLENDER\/tools\/render_tham_chieu.py EP01 --chi F02_R3 --phan clip/.test(rt), `▶ render F02_R3 → ${rt}`);
+  (bp.$$('#shots [data-cmd="refRender"]')[0] as HTMLElement).click();
+  await bp.settle(10);
+  ok(/--chi \w+ --phan anh,clip,key,bang/.test(V.terminals[V.terminals.length - 1]), `bảng shot ▶ tham chiếu → ${V.terminals[V.terminals.length - 1]}`);
   V.commands.executeCommand('aiFilmStudio.openStep', 'blender', { ep: 'EP01', seg: 'F', scene: 'F02' });
   const bs = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
   await bs.settle();

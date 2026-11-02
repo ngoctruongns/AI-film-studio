@@ -27,6 +27,8 @@ export interface BlenderConfig {
   renderCommand?: string;
   /** lệnh lưu file đang mở trong Blender (máy khác) về repo: {file} = đường dẫn đích trong repo */
   pullCommand?: string;
+  /** script render tham chiếu của dự án (đường dẫn từ gốc repo): "<script> <tập> --ds" → JSON danh sách · bảng "Render tham chiếu" của tab 🧊 Blender */
+  refRender?: string;
 }
 
 export const DEFAULT_BLENDER: BlenderConfig = {
