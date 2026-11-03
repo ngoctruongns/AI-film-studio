@@ -174,7 +174,7 @@ export class StepPanel {
     if (mr && fs.existsSync(mr)) dirs.push({ dir: mr, inRepo: false });
     for (const d of this.studio.config?.project.paths.sceneMedia ?? []) {
       const abs = this.studio.abs(fill(d, rs.ph));
-      if (fs.existsSync(abs)) dirs.push({ dir: abs, inRepo: true });
+      if (fs.existsSync(abs)) dirs.push({ dir: abs, inRepo: this.studio.inRepo(abs) });
     }
     return dirs;
   }
@@ -1267,7 +1267,7 @@ function renderMedia(md, scene) {
       + '<button class="link" data-cmd="openMedia" data-arg="' + esc(f.abs) + '">mở</button><button class="link" data-cmd="revealMedia" data-arg="' + esc(f.abs) + '">thư mục</button></div>';
   }).join('');
   let h = '<h2>' + (md.renderOnly ? 'Ảnh / clip render Blender của ' : 'Media của ') + esc(scene) + ' <span class="muted">' + (md.rootFound ? esc(md.root) : 'không thấy thư mục media ' + esc(md.root || '') + ' — đặt trong Cài đặt AI') + '</span></h2>'
-    + (md.renderOnly ? '<p class="muted">File <code>' + esc(scene) + '_R…</code> (clip, key frame) trong thư mục media và seedance_clip/ của tập. Render bằng script ▶ bên dưới.</p>'
+    + (md.renderOnly ? '<p class="muted">File <code>' + esc(scene) + '_R…</code> (clip, key frame) trong thư mục media và thư mục render tham chiếu (~/LS600_render/tham_chieu/&lt;tập&gt;). Render bằng script ▶ bên dưới.</p>'
       : '<div class="row"><button data-cmd="import">Nhập file… (đổi tên theo mã)</button><span class="muted">chép file tải về vào thư mục media, file gốc giữ nguyên</span></div>')
     + '<div class="row" style="align-items:flex-start;margin-top:8px">' + (items || '<span class="muted">Chưa có file nào mang mã ' + esc(scene) + '.</span>') + '</div>';
   if (md.full) {

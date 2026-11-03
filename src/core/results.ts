@@ -16,7 +16,7 @@ export interface MediaFile {
   ext: string;
   type: 'image' | 'video' | 'audio' | 'other';
   mtime: number;
-  /** nằm trong repo (seedance_clip/) hay thư mục media ngoài */
+  /** nằm trong repo hay thư mục media ngoài (render tham chiếu ~/LS600_render, media của máy) */
   inRepo: boolean;
 }
 
@@ -24,7 +24,7 @@ const IMG = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VID = new Set(['.mp4', '.webm', '.mov', '.mkv']);
 const AUD = new Set(['.wav', '.mp3', '.m4a', '.ogg', '.flac']);
 
-/** Tên file theo mã: EP01_K02_V3.mp4 · EP01_F02_R1_I0.png · F02_R1.mp4 (seedance_clip, không tiền tố tập) · EP01_F02_I0-v2.png */
+/** Tên file theo mã: EP01_K02_V3.mp4 · EP01_F02_R1_I0.png · F02_R1.mp4 (không tiền tố tập) · EP01_F02_I0-v2.png */
 export function parseMediaName(name: string, ep: string, scene: string): Omit<MediaFile, 'abs' | 'mtime' | 'inRepo'> | undefined {
   const ext = path.extname(name).toLowerCase();
   const base = name.slice(0, name.length - ext.length);

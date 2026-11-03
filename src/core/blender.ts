@@ -39,7 +39,7 @@ export const DEFAULT_BLENDER: BlenderConfig = {
   register: '{episodeDir}/blender/SO-BLENDER.md',
   fps: 24,
   cameraPrefix: 'CAM_',
-  methods: ['V2', 'BL', 'V6'],
+  methods: ['V2', 'BL', 'BK'],
   methodColumn: 'Cách',
   renderCommand: '"{blender}" -b "{file}" -s {start} -e {end} -o "//render/{shot}_R1_" -a',
 };

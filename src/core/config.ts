@@ -41,7 +41,7 @@ export interface ProjectConfig {
   paths: {
     episodes: string;
     media?: string;
-    /** Thư mục media phụ trong repo, quét thêm theo mã cảnh (vd. '{episodeDir}/seedance_clip') */
+    /** Thư mục media phụ, quét thêm theo mã cảnh — tương đối gốc repo hoặc `~/…` (vd. '~/LS600_render/tham_chieu/{ep}') */
     sceneMedia?: string[];
   };
   episode: {

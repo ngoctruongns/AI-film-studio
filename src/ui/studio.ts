@@ -1,5 +1,6 @@
 // Trạng thái chung của extension: gốc dự án, cấu hình, mô hình đã quét, ghi chú, lỗi soát. Quét lại khi file đổi.
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { StudioConfig, hasStudio, loadStudioConfig } from '../core/config';
@@ -94,8 +95,15 @@ export class Studio implements vscode.Disposable {
     return this.root ? path.relative(this.root, abs).split(path.sep).join('/') : abs;
   }
 
+  /** đường dẫn tuyệt đối — tương đối tính từ gốc repo, `~/…` là thư mục nhà của máy này */
   abs(rel: string): string {
+    if (rel === '~' || rel.startsWith('~/')) return path.join(os.homedir(), rel.slice(1));
     return path.isAbsolute(rel) ? rel : path.join(this.root ?? '', rel);
+  }
+
+  inRepo(abs: string): boolean {
+    const r = path.relative(this.root ?? '', abs);
+    return !!this.root && !r.startsWith('..') && !path.isAbsolute(r);
   }
 
   exists(rel: string): boolean {

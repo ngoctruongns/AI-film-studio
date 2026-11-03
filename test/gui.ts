@@ -390,7 +390,15 @@ async function main() {
   ok(/^Render tham chiếu · EP01: python3? 04_PRODUCTION\/BLENDER\/tools\/render_tham_chieu.py EP01 --chi F02_R3 --phan clip/.test(rt), `▶ render F02_R3 → ${rt}`);
   (bp.$$('#shots [data-cmd="refRender"]')[0] as HTMLElement).click();
   await bp.settle(10);
-  ok(/--chi \w+ --phan anh,clip,key,bang/.test(V.terminals[V.terminals.length - 1]), `bảng shot ▶ tham chiếu → ${V.terminals[V.terminals.length - 1]}`);
+  ok(/--chi \w+ --phan anh,clip,key$/.test(V.terminals[V.terminals.length - 1]), `bảng shot ▶ tham chiếu → ${V.terminals[V.terminals.length - 1]}`);
+  // prompt ảnh thật dưới dòng sheet / ảnh tĩnh (blender/ANH-THAT_prompt.md) — khung chung đã ghép, tên file đã thay
+  const pVt = bp.$$('#refs tr.prow').find((r) => r.previousElementSibling?.children[0]?.textContent === '13_van_the')!;
+  ok(!!pVt?.querySelector('details pre.prompt') && pVt.textContent!.includes('@13_van_the_sheet_khong_chu') && pVt.textContent!.includes('Xe thang mây'), `prompt 13_van_the: ${pVt?.textContent?.slice(0, 160)}`);
+  (pVt.querySelector('[data-cmd="copy"]') as HTMLElement).click();
+  await bp.settle(10);
+  ok(/^Vẽ lại tấm @13_van_the_sheet_khong_chu/.test(V.clipboard.text ?? '') && !(V.clipboard.text ?? '').includes('@<PHOTO>'), `📋 chép prompt sheet → ${(V.clipboard.text ?? '').slice(0, 60)}`);
+  const pTh = bp.$$('#refs tr.prow').find((r) => r.previousElementSibling?.children[0]?.textContent === 'REF_THANH_DABANG_R1')!;
+  ok(pTh?.textContent!.includes('Biến render @EP01_REF_THANH_DABANG_R1'), 'prompt ảnh thành Đa Bang');
   V.commands.executeCommand('aiFilmStudio.openStep', 'blender', { ep: 'EP01', seg: 'F', scene: 'F02' });
   const bs = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
   await bs.settle();

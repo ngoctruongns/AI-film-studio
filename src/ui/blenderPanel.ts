@@ -108,6 +108,7 @@ export class BlenderPanel {
     this.refErr = undefined;
     try {
       this.refs = await listRefs(this.python(), script, this.epId, this.studio.root);
+      for (const d of this.refs.ds) if (d.prompt) (d.prompt as any).abs = this.studio.abs(d.prompt.file);
     } catch (e: any) {
       this.refs = undefined;
       this.refErr = e.message ?? String(e);
@@ -147,7 +148,7 @@ export class BlenderPanel {
     const ph = placeholdersFor(model, ep);
     const mediaDirs = [
       ...(model.mediaFound && model.mediaRoot ? [{ dir: model.mediaRoot, inRepo: false }] : []),
-      ...(model.config.project.paths.sceneMedia ?? []).map((d) => ({ dir: this.studio.abs(fill(d, ph)), inRepo: true })).filter((d) => fs.existsSync(d.dir)),
+      ...(model.config.project.paths.sceneMedia ?? []).map((d) => this.studio.abs(fill(d, ph))).filter((d) => fs.existsSync(d)).map((dir) => ({ dir, inRepo: this.studio.inRepo(dir) })),
     ];
     return {
       ep: ep.id,
@@ -182,7 +183,14 @@ export class BlenderPanel {
       }),
       issues: bm.issues,
       ref: bm.cfg.refRender
-        ? { script: bm.cfg.refRender, list: this.refs, error: this.refErr, python: this.python(), sceneTitles: Object.fromEntries([...scenes].map(([k, v]) => [k, v.c.title])) }
+        ? {
+            script: bm.cfg.refRender,
+            list: this.refs,
+            error: this.refErr,
+            python: this.python(),
+            sceneTitles: Object.fromEntries([...scenes].map(([k, v]) => [k, v.c.title])),
+            promptFile: this.refs?.prompt_file ? { rel: this.refs.prompt_file, abs: this.studio.abs(this.refs.prompt_file) } : undefined,
+          }
         : undefined,
     };
   }
@@ -355,6 +363,8 @@ const BODY = `
 </div>
 <div class="row"><input id="rfilter" placeholder="lọc: F02, F02_R3, REF, linh_ho…" size="30"><label><input type="checkbox" id="rmissing"> chỉ cái còn thiếu</label><span id="rcount" class="muted"></span></div>
 <div id="rsub" class="muted"></div>
+<div id="rhint" class="muted">Ảnh dùng chung (thành, vân thê, binh lính…): render dòng <b>character sheet</b> / <b>ảnh tĩnh</b> → mở <b>📝 prompt ảnh thật</b> ngay dưới dòng → chép, dán vào SeeDream cùng các file ở mục <i>nạp</i>.</div>
+<style>#refs tr.prow td { border-top: none; padding-top: 0 } #refs pre.prompt { white-space: pre-wrap; max-width: 110ch; margin: 4px 0 } #refs details summary { cursor: pointer }</style>
 <div class="scroll-x" id="refs" style="margin-top:6px"></div>
 </div>
 <h2>Shot ↔ cảnh <span class="muted">(thứ tự chiếu)</span></h2>
@@ -420,11 +430,24 @@ function renderShots() {
       + '<td>' + src + '</td><td>' + refs + (s.note ? '<div class="muted">' + esc(s.note) + '</div>' : '') + '</td>'
       + '<td style="white-space:nowrap"><button class="link" data-cmd="goto" data-arg="' + esc(s.file + '|' + s.code) + '" title="đặt preview range + camera trong Blender đang mở">xem trong Blender</button>'
       + (s.render ? '<button class="link" data-cmd="copy" data-arg="' + esc(s.render) + '" title="' + esc(s.render) + '">chép lệnh render</button>' + (vm.blender.path ? '<button class="link" data-cmd="render" data-arg="' + esc(s.render) + '" title="render thô cả khung hình của shot ra //render/ cạnh file .blend">render thô</button>' : '') : '')
-      + (vm.ref ? '<button class="link" data-cmd="refRender" data-arg="' + esc(s.scene + '|anh,clip,key,bang|') + '" title="render tham chiếu còn thiếu của cảnh ' + esc(s.scene) + ' theo sổ (key frame, clip _R1/_R2…, bảng 2×2)">▶ tham chiếu</button>' : '') + '</td></tr>';
+      + (vm.ref ? '<button class="link" data-cmd="refRender" data-arg="' + esc(s.scene + '|anh,clip,key|') + '" title="render tham chiếu còn thiếu của cảnh ' + esc(s.scene) + ' theo sổ (key frame, clip _R1/_R2…)">▶ tham chiếu</button>' : '') + '</td></tr>';
   }).join('');
   $('shots').innerHTML = '<table><tr><th>Cảnh</th><th>Shot</th><th>File</th><th>Camera</th><th>Frame</th><th>Số frame</th><th>Giây / bảng</th><th>Nguồn</th><th>Clip tham chiếu / Ra</th><th></th></tr>' + rows + '</table>';
 }
-const LOAI = { sheet: 'character sheet', anh: 'ảnh tĩnh', key: 'key frame', clip: 'clip', bang: 'bảng 2×2' };
+const LOAI = { sheet: 'character sheet', anh: 'ảnh tĩnh', key: 'key frame', clip: 'clip' };
+// prompt biến render thành ảnh thật (sheet, ảnh tĩnh) — mục cùng mã trong blender/ANH-THAT_prompt.md
+function promptRow(d) {
+  if (d.loai !== 'sheet' && d.loai !== 'anh') return '';
+  const p = d.prompt;
+  const file = vm.ref.promptFile;
+  if (!p) return '<tr class="prow"><td></td><td colspan="5" class="muted">chưa có prompt ảnh thật — thêm mục <code>## \x60' + esc(d.ma) + '\x60</code> vào '
+    + (file ? '<a data-open="' + esc(file.abs) + '">' + esc(file.rel) + '</a>' : '<code>blender/ANH-THAT_prompt.md</code>') + '</td></tr>';
+  const meta = [p.ra && 'ra <code>' + esc(p.ra) + '</code>', p.model && esc(p.model), p.nap && 'nạp <code>' + esc(p.nap) + '</code>'].filter(Boolean).join(' · ');
+  return '<tr class="prow"><td></td><td colspan="5"><details><summary>📝 prompt ảnh thật</summary><div class="muted">' + meta + '</div>'
+    + '<pre class="prompt">' + esc(p.prompt || '') + '</pre>'
+    + '<button class="link" data-cmd="copy" data-arg="' + esc(p.prompt || '') + '">📋 chép prompt</button> '
+    + '<a data-open="' + esc(p.abs) + '" data-line="' + Math.max(0, (p.dong || 1) - 1) + '">mở mục trong file</a></details></td></tr>';
+}
 function renderRefs() {
   const r = vm.ref;
   $('refBox').hidden = !r;
@@ -439,7 +462,7 @@ function renderRefs() {
   const all = r.list.ds;
   const list = all.filter((d) => (!q || (d.ma + ' ' + d.loai + ' ' + (d.file || '') + ' ' + LOAI[d.loai]).toLowerCase().includes(q)) && (!miss || !d.co));
   $('rcount').textContent = all.filter((d) => d.co).length + ' / ' + all.length + ' đã có · đang hiện ' + list.length;
-  $('rsub').innerHTML = 'ra: <code>' + esc(r.list.out) + '</code> · python: <code>' + esc(r.python) + '</code> · Blender: <code>' + esc(vm.blender.path || 'tự tìm (PATH / Program Files)') + '</code>';
+  $('rsub').innerHTML = 'ra: <code>' + esc(r.list.out) + '</code>' + (r.promptFile ? ' · prompt ảnh thật: <a data-open="' + esc(r.promptFile.abs) + '">' + esc(r.promptFile.rel) + '</a>' : '') + ' · python: <code>' + esc(r.python) + '</code> · Blender: <code>' + esc(vm.blender.path || 'tự tìm (PATH / Program Files)') + '</code>';
   const groups = new Map();
   for (const d of list) {
     const g = d.loai === 'key' || d.loai === 'clip' ? d.canh : d.loai;
@@ -457,11 +480,12 @@ function renderRefs() {
       + (thieu ? btn(arg, '▶ render ' + thieu + ' còn thiếu', 'render mọi mục còn thiếu của nhóm này') : '<span class="ok">✓ đủ</span>') + '</th></tr>';
     for (const d of ds) {
       const ten = d.dich.split(/[\\\\/]/).pop();
-      const fr = d.frame ? (d.frame[0] === d.frame[1] ? d.frame[0] : d.frame[0] + ' – ' + d.frame[1]) : (d.o ? d.o.join(' · ') : (d.phan_doan || []).join(', '));
+      const fr = d.frame ? (d.frame[0] === d.frame[1] ? d.frame[0] : d.frame[0] + ' – ' + d.frame[1]) : (d.phan_doan || []).join(', ');
       const ra = d.co ? '<a data-open="' + esc(d.dich) + '"><span class="ok">✓</span> ' + esc(ten) + '</a>' : '<span class="muted">— ' + esc(ten) + '</span>';
       const one = d.ma + '|' + d.loai + '|';
       h += '<tr><td><b>' + esc(d.ma) + '</b></td><td>' + esc(LOAI[d.loai] || d.loai) + '</td><td>' + esc(d.file || '') + '</td><td style="white-space:nowrap">' + esc(fr) + '</td><td>' + ra + '</td>'
-        + '<td style="white-space:nowrap">' + (d.co ? btn(one + 'l', '↻ render lại', 'render lại, ghi đè file đã có') : btn(one, '▶ render', 'render mục này')) + '</td></tr>';
+        + '<td style="white-space:nowrap">' + (d.co ? btn(one + 'l', '↻ render lại', 'render lại, ghi đè file đã có') : btn(one, '▶ render', 'render mục này')) + '</td></tr>'
+        + promptRow(d);
     }
   }
   $('refs').innerHTML = h + '</table>';
