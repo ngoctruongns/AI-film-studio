@@ -490,7 +490,17 @@ function dateOf(r) {
   const d = new Date(S.firstDate); d.setDate(d.getDate() + (Number(m[1]) - S.firstEpisode) * S.everyDays);
   return d.toLocaleDateString('vi-VN');
 }
+// ô Hình (textarea) tự cao theo chữ; ô anh kéo cao hơn thì nhớ theo mã cảnh (TH), render lại không mất
+const TH = {};
+function fit(t) {
+  if (!t || t.tagName !== 'TEXTAREA') return;
+  t.style.height = 'auto';
+  const k = rows[+t.dataset.r] ? codeOf(rows[+t.dataset.r]) : '';
+  t.style.height = Math.max(56, t.scrollHeight + 4, TH[k] || 0) + 'px';
+}
+function fitAll() { document.querySelectorAll('#grid textarea').forEach(fit); }
 function render() {
+  const sy = window.scrollY, sx = document.querySelector('.scroll-x'), sl = sx ? sx.scrollLeft : 0;
   renumber();
   $('lists').innerHTML = Object.entries(G.lists).map(([i, vals]) => '<datalist id="dl' + i + '">' + vals.map((v) => '<option value="' + esc(v) + '">').join('') + '</datalist>').join('');
   const W = (h) => G.widths[h] || 140;
@@ -510,7 +520,7 @@ function render() {
         const rel = G.release && ci === G.release.index;
         const ro = (ci === G.codeIndex && r.line >= 0) || rel;
         const attrs = ' data-r="' + ri + '" data-c="' + ci + '"';
-        if (ci === G.wideIndex) return '<td><textarea' + attrs + ' style="min-height:56px">' + esc(c) + '</textarea></td>';
+        if (ci === G.wideIndex) return '<td><textarea' + attrs + ' style="min-height:56px;overflow:hidden">' + esc(c) + '</textarea></td>';
         if (ci === G.statusIndex && G.statusChoices.length && (!dropped || G.statusChoices.some((o) => o.value === G.dropSymbol))) {
           const cur = G.statusChoices.find((o) => String(c).trim().startsWith(o.value));
           return '<td><select' + attrs + ' title="' + esc(c) + '">' + (cur ? '' : '<option value="' + esc(c) + '" selected>' + esc(c || '—') + '</option>')
@@ -520,12 +530,22 @@ function render() {
       }).join('') + (SW ? '<td class="muted" style="white-space:nowrap">' + esc(dateOf(r)) + (EMB && G.haveDir && G.haveDir.includes(codeOf(r)) ? ' <a data-cmd="target" data-arg="' + esc(JSON.stringify({ ep: codeOf(r) })) + '">mở</a>' : '') + '</td>' : '') + '</tr>';
   }).join('');
   sum();
+  fitAll();
+  window.scrollTo(window.scrollX, sy); if (sx) sx.scrollLeft = sl;
 }
 function edit(e) {
   const t = e.target; if (t.dataset.r === undefined || t.dataset.c === undefined) return;
   rows[+t.dataset.r].cells[+t.dataset.c] = t.value; mark();
 }
-document.addEventListener('input', edit);
+document.addEventListener('input', (e) => { edit(e); fit(e.target); });
+// anh kéo góc ô Hình: cao hơn mức vừa chữ thì nhớ theo mã cảnh
+document.addEventListener('mouseup', (e) => {
+  const t = e.target; if (!t || t.tagName !== 'TEXTAREA' || !rows[+t.dataset.r]) return;
+  const k = codeOf(rows[+t.dataset.r]), h = t.offsetHeight;
+  t.style.height = 'auto'; const auto = Math.max(56, t.scrollHeight + 4); t.style.height = h + 'px';
+  if (h > auto + 6) TH[k] = h; else delete TH[k];
+});
+window.addEventListener('resize', fitAll);
 document.addEventListener('change', (e) => { if (e.target.tagName === 'SELECT') { edit(e); if (G && e.target.dataset.c !== undefined && +e.target.dataset.c === G.statusIndex) render(); } });
 // kéo đổi độ rộng cột
 let RZ = null;
@@ -542,7 +562,7 @@ document.addEventListener('mousemove', (e) => {
 });
 document.addEventListener('mouseup', () => {
   if (!RZ) return; RZ.h.classList.remove('on');
-  post({ type: 'widths', widths: { [G.headers[RZ.i]]: G.widths[G.headers[RZ.i]] } }); RZ = null;
+  post({ type: 'widths', widths: { [G.headers[RZ.i]]: G.widths[G.headers[RZ.i]] } }); RZ = null; fitAll();
 });
 document.addEventListener('dblclick', (e) => {
   const h = e.target.closest('[data-rz]'); if (!h) return;
