@@ -33,7 +33,7 @@ export function setStatusText(cell: string, to: StatusKey, p: ProjectConfig): st
   if (!first) return text ? `${sym}${label} · ${text}` : `${sym}${label}`;
   const before = text.slice(0, first.i);
   let after = text.slice(first.i + first.s.length);
-  const cut = after.replace(/^\s*(chờ duyệt|đang viết|chưa làm|đã duyệt|duyệt|treo)\b/i, '');
+  const cut = after.replace(/^\s*(chờ duyệt|đang viết|chưa làm|chưa duyệt|đã duyệt|duyệt|treo)\b/i, '');
   if (cut !== after) after = cut.replace(/^\s*[·—–:-]\s*/, ' ');
   after = after.replace(/^\s+/, ' ');
   return `${before}${sym}${label}${after && label && !after.startsWith(' ·') ? ' ·' : ''}${after}`.replace(/\s+/g, ' ').trim();

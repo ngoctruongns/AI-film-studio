@@ -28,7 +28,7 @@ const AUD = new Set(['.wav', '.mp3', '.m4a', '.ogg', '.flac']);
 export function parseMediaName(name: string, ep: string, scene: string): Omit<MediaFile, 'abs' | 'mtime' | 'inRepo'> | undefined {
   const ext = path.extname(name).toLowerCase();
   const base = name.slice(0, name.length - ext.length);
-  const m = new RegExp(`^(?:${ep}_)?${scene}_([IVRALE])(\\d+)(?:_([IV]\\d+))?(?:-v(\\d+))?$`).exec(base);
+  const m = new RegExp(`^(?:${ep}_)?${scene}_([IVRALEW])(\\d+)(?:_([IV]\\d+))?(?:-v(\\d+))?$`).exec(base);
   if (!m) return undefined;
   return {
     name,

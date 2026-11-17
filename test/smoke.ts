@@ -48,7 +48,7 @@ console.log(`\nMã kế tiếp EP01: phân đoạn ${nextSegmentCode(ledger, 'EP
 
 for (const [stepId, target] of [
   ['chia-canh', { ep: 'EP01', seg: 'K' }],
-  ['prompt', { ep: 'EP01', seg: 'K', scene: 'K02' }],
+  ['anh', { ep: 'EP01', seg: 'K', scene: 'K02' }],
   ['kich-ban', { ep: 'EP01', seg: 'A' }],
 ] as const) {
   const step = cfg.pipeline.steps.find((s) => s.id === stepId)!;
@@ -128,6 +128,24 @@ import { appendAttempt, attemptStats, parseAttempts } from '../src/core/attempts
   console.log(`Soát prompt: F98 / F97 / F96 (đúng — tên khai báo, thẻ tên file, tiếng Anh) → ${okRange.length ? '✗ ' + got.filter((g) => g.line >= 9 && g.line < at('## F95')).map((g) => g.message).join(' | ') : '✓ không báo'}`);
   const want95 = ['P10', 'P2', 'P4', 'P6', 'P9'];
   console.log(`Soát prompt: F95 (sai, tiếng Anh) → ${f95.join(',')} ${JSON.stringify(f95) === JSON.stringify(want95) ? '✓' : '✗ cần ' + want95}`);
+  // ⑨/⑩ (17/11/2026): hai dòng "Nạp — chung" + "Nạp — riêng" là MỘT bảng nạp; dòng Nạp của tiểu mục "### Ảnh …" không soát như video
+  const split = [
+    '## A12 · Chế Bồng Nga · 5 s',
+    '### Ảnh 1 · `EP01_A12_I0` — khung đầu',
+    '**Nạp — chung:** `EP01_REF_DC_LINH_CHIEM` · `EP01_REF_CHE_BONG_NGA_GOC`',
+    '**Nạp — riêng:** `EP01_A09_W2`',
+    '### Video · Seedance 2.0 · 5 s',
+    '**Nạp — chung (tập / dự án):** `EP01_REF_CHE_BONG_NGA_GOC`',
+    '**Nạp — riêng (phân đoạn):** `EP01_A12_I0`',
+    '```',
+    '@EP01_A12_I0 là khung hình đầu. Người trên lưng voi là vua Chế Bồng Nga, khuôn mặt đúng như @EP01_REF_CHE_BONG_NGA_GOC.',
+    'Thực hiện video lần lượt theo các cảnh sau:',
+    '【Cảnh 1】 low angle. Con voi đứng yên.',
+    'Ràng buộc: không phụ đề.',
+    '```',
+  ].join('\n');
+  const gs = lintPromptText(split, cfgL).filter((g) => ['P1', 'P2', 'P3', 'P5'].includes(g.rule));
+  console.log(`Soát prompt: ⑨/⑩ Nạp — chung + riêng → ${gs.length ? '✗ ' + gs.map((g) => g.message).join(' | ') : '✓ không báo P1 / P2 / P3 / P5'}`);
   if (JSON.stringify(f99) !== JSON.stringify(want) || okRange.length || JSON.stringify(f95) !== JSON.stringify(want95)) process.exitCode = 1;
 
   // sổ thử nghiệm

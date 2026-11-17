@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { STATUS_LABEL, Scope, StepSpec, statusSymbol } from '../core/config';
 import { ApproveLevel, applyPlan, planApprove } from '../core/approve';
-import { formatDuration } from '../core/markdown';
+import { columnIndex, findSection, formatDuration, parseTables } from '../core/markdown';
 import { ResolvedStep, StepTarget, buildPrompt, extractOutput, mergeOutput, resolveStep, targetKey } from '../core/context';
 import { ModelConfig, estimateCost } from '../core/providers';
 import { MediaFile, listSceneMedia, mediaTargetName, upsertResult } from '../core/results';
@@ -22,13 +22,14 @@ import { EPISODE_CODE_RE } from '../core/episodeList';
 import { mergeSegmentTable, setSegmentStatus } from '../core/segmentTable';
 import { slugify } from '../core/episodeList';
 import { createSegmentDir } from './commands';
-import { GRID_BODY, GridController, finalizeCodes, finalizeEpisodeList, gridClientJs } from './gridPanel';
+import { GRID_BODY, GridController, finalizeCodes, finalizeEpisodeList, gridClientJs, tikSpec, TIK_CODE_RE } from './gridPanel';
 import { CHAT_BODY, CHAT_JS, ChatController } from './chat';
 import { scanBlender } from '../core/blender';
 import { gotoShotInBlender } from './blenderPanel';
 import { ModelRegistry } from './models';
 import { Studio } from './studio';
 import { handleOpen, renderMarkdown, shell } from './webview';
+import { LoadRef, findMedia, loadRefs, mediaIndex, setPartStatus, splitScene, stepOf } from '../core/sceneParts';
 
 interface PanelState {
   /** bước đang hiện — trống thì lấy bước đầu của cấp */
@@ -68,7 +69,7 @@ export class StepPanel {
   private shown?: number;
   /** lưới bảng cảnh nằm trong tab (bước ⑥ Phân cảnh) */
   private gridCtl?: GridController;
-  private gridKind?: 'scenes' | 'lines' | 'episodes';
+  private gridKind?: 'scenes' | 'lines' | 'episodes' | 'tik';
   private readonly subs: vscode.Disposable[] = [];
 
   /** Mở tab của đối tượng; có stepId thì chọn luôn bước đó */
@@ -103,7 +104,8 @@ export class StepPanel {
 
   /** Webview chỉ được đọc ảnh trong repo dự án + thư mục media */
   private static roots(studio: Studio): vscode.Uri[] {
-    const r = [studio.root, studio.model?.mediaRoot].filter((x): x is string => !!x && fs.existsSync(x));
+    const extra = (studio.config?.project.paths.sceneMedia ?? []).map((d) => studio.abs(d.split('{')[0].replace(/\/+$/, '')));
+    const r = [studio.root, studio.model?.mediaRoot, ...extra].filter((x): x is string => !!x && fs.existsSync(x));
     return r.map((x) => vscode.Uri.file(x));
   }
 
@@ -382,8 +384,8 @@ export class StepPanel {
       compare: this.compareIds.get(this.stepId),
       estimate,
       scripts,
-      grid: (view.includes('grid') && !!seg?.files['canh']) || (view.includes('lines') && !!seg?.files['loi']) || (view.includes('synopsis') && !!this.studio.config?.project.episodeList),
-      gridKind: view.includes('lines') ? 'lines' : view.includes('synopsis') ? 'episodes' : 'scenes',
+      grid: (view.includes('grid') && !!seg?.files['canh']) || (view.includes('lines') && !!seg?.files['loi']) || (view.includes('synopsis') && !!this.studio.config?.project.episodeList) || (view.includes('tik') && !!ep),
+      gridKind: view.includes('lines') ? 'lines' : view.includes('synopsis') ? 'episodes' : view.includes('tik') ? 'tik' : 'scenes',
       scene: scene && {
         code: scene.code,
         seconds: scene.seconds,
@@ -409,8 +411,8 @@ export class StepPanel {
     if (m.__grid) {
       const t = this.state.target;
       const view = this.resolve()?.step.view ?? [];
-      const kind = view.includes('lines') ? 'lines' : view.includes('synopsis') ? 'episodes' : 'scenes';
-      if (!t.seg && kind !== 'episodes') return;
+      const kind = view.includes('lines') ? 'lines' : view.includes('synopsis') ? 'episodes' : view.includes('tik') ? 'tik' : 'scenes';
+      if (!t.seg && kind !== 'episodes' && kind !== 'tik') return;
       if (!this.gridCtl || this.gridKind !== kind) {
         this.gridCtl = new GridController(this.studio, (x) => this.panel.webview.postMessage(x), t.ep, t.seg, kind);
         this.gridKind = kind;
@@ -418,6 +420,26 @@ export class StepPanel {
       return this.gridCtl.onMessage(m);
     }
     switch (m.type) {
+      case 'partStatus': {                               // ⑨ / ⑩: ✅ đạt · ❌ loại · ⬜ chưa — ghi ở đầu tiêu đề tiểu mục
+        const { seg } = this.nodes();
+        const pf = seg?.files['prompt'];
+        if (!pf || !fs.existsSync(pf)) return;
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === pf);
+        if (doc?.isDirty) return void vscode.window.showWarningMessage(`${path.basename(pf)} đang có thay đổi chưa lưu — lưu trước.`);
+        const lines = fs.readFileSync(pf, 'utf8').split('\n');
+        const i = Number(m.line);
+        if (!/^#+\s/.test(lines[i] ?? '') || !String(lines[i]).includes(String(m.title ?? '').replace(/^\s*(?:[✅❌⬜]️?\s*)+/u, '').slice(0, 20))) {
+          return void vscode.window.showWarningMessage('File prompt đã đổi — tải lại tab rồi bấm lại.');
+        }
+        lines[i] = setPartStatus(lines[i], m.to);
+        fs.writeFileSync(pf, lines.join('\n'), 'utf8');
+        this.studio.refresh();
+        return this.post();
+      }
+      case 'mdRender': {                                 // ô soạn markdown ở chế độ 👁 Xem
+        const html = await renderMarkdown(this.studio, String(m.text ?? ''), path.join(this.studio.root ?? '.', 'x.md'));
+        return void this.panel.webview.postMessage({ type: 'mdHtml', id: m.id, html });
+      }
       case 'ready':
         return this.post();
       case 'open':
@@ -435,6 +457,7 @@ export class StepPanel {
       case 'selectStep':
         return this.select(String(m.id));
       case 'approve':
+        if (m.gridDirty) return void vscode.window.showWarningMessage('Bảng cảnh còn thay đổi chưa lưu (● chưa lưu) — bấm Lưu trước rồi duyệt.');
         return this.approve(m.undo === true);
       case 'saveResult':
         return this.saveResult(m.result);
@@ -467,9 +490,10 @@ export class StepPanel {
           case 'showPrompt':
             return this.showPrompt();
           case 'run':
-            return this.startRuns(m.arg === 'skip', false);
           case 'runCompare':
-            return this.startRuns(m.arg === 'skip', true);
+            // bảng trong tab còn thay đổi chưa lưu (vd. vừa tick ✅) → AI đọc file trên đĩa sẽ không thấy → bắt lưu trước (16/11/2026)
+            if (m.gridDirty) return void vscode.window.showWarningMessage('Bảng còn thay đổi chưa lưu (● chưa lưu) — bấm Lưu trước khi chạy AI, không thì các cảnh vừa duyệt chưa được khóa.');
+            return this.startRuns(m.arg === 'skip', m.cmd === 'runCompare');
           case 'cancel':
             this.aborts.get(m.arg)?.abort();
             return;
@@ -681,8 +705,22 @@ export class StepPanel {
       vscode.window.showWarningMessage(`${path.basename(rs.output.abs)} đang có thay đổi chưa lưu — lưu hoặc bỏ trước khi Nhận.`);
       return;
     }
+    // khóa lại theo file HIỆN TẠI: phần duyệt / bỏ trong lúc AI chạy hoặc lúc xem diff cũng được giữ (16/11/2026 — trước chỉ khóa theo lúc bấm chạy)
+    let text = fs.readFileSync(prop, 'utf8');
+    // ⑨ / ⑩: ghép lại theo file hiện tại — tiểu mục ✅ / ❌ và phần của bước kia giữ nguyên
+    const sel = rs.output.ref.select;
+    if (rs.step.output?.part && sel?.startsWith('heading:')) {
+      const ps = findSection(text, sel.slice('heading:'.length));
+      if (ps) text = mergeOutput(rs, ps.text);
+    }
+    const lk = this.lockNow(rs);
+    if (lk) {
+      const pr = lk(text);
+      text = pr.text;
+      if (pr.restored.length) vscode.window.showInformationMessage(`Giữ nguyên các mục đã duyệt / bỏ ở file hiện tại: ${pr.restored.join(', ')}.`);
+    }
     fs.mkdirSync(path.dirname(rs.output.abs), { recursive: true });
-    fs.writeFileSync(rs.output.abs, fs.readFileSync(prop, 'utf8'), 'utf8');
+    fs.writeFileSync(rs.output.abs, text, 'utf8');
     rec.status = 'applied';
     writeRun(this.studio.root!, rec);
     vscode.window.showInformationMessage(`Đã ghi ${rs.output.rel} (bản của ${rec.modelId}). Xem bằng git diff — tool không git add.`);
@@ -699,7 +737,7 @@ export class StepPanel {
       if (added.length) vscode.window.showInformationMessage(`Tool cấp mã mới: ${added.join(', ')}.`);
       for (const id of rs.step.protect === 'scenes' ? ['chu-thich-ma'] : ['tong-hop-loi']) await this.scriptQuiet(id, rs);
     }
-    if (rs.step.view?.some((v) => ['grid', 'lines', 'synopsis'].includes(v))) this.gridCtl?.load();
+    if (rs.step.view?.some((v) => ['grid', 'lines', 'synopsis', 'tik'].includes(v))) this.gridCtl?.load();
     // ④ kịch bản chi tiết: bảng phân đoạn AI viết → nhận dòng mới vào README tập (mục con trên cây)
     if (rs.step.view?.includes('segments')) {
       const { ep } = this.nodes();
@@ -715,6 +753,7 @@ export class StepPanel {
       }
     }
     this.studio.refresh();
+    this.gridCtl?.load();
   }
 
   private discard(id: string): void {
@@ -804,12 +843,95 @@ export class StepPanel {
       const L = p.linesTable ?? { codeColumn: 'Mã', statusColumn: 'Trạng thái' };
       t = { codeColumn: L.codeColumn, codeRe: new RegExp(`^${p.codes.line}$`), statusColumn: L.statusColumn, lockSymbols: [...done, '✍'] };
     }
+    // ⑪ tik: khóa dòng ✅ / ❌
+    if (kind === 'tik') { const T = tikSpec(p); t = { codeColumn: T.codeColumn, codeRe: TIK_CODE_RE, statusColumn: T.statusColumn, lockSymbols: done }; }
     // tập: chỉ khóa ✅ — tập ❌ bỏ thì AI / tool xóa khỏi danh sách (29/10/2026)
     if (kind === 'episodes' && p.episodeList) t = { codeColumn: p.episodeList.codeColumn, codeRe: EPISODE_CODE_RE, statusColumn: p.episodeList.statusColumn, lockSymbols: p.status.done ?? ['✅'] };
     if (!t) return none;
     const tt = t;
     const codes = lockedRows(original, tt);
     return { codes, apply: (x) => protectTable(original, x, tt, codes) };
+  }
+
+  /** ⑨ Tạo ảnh · ⑩ Tạo video — mục cảnh trong <X>_prompt.md tách theo tiểu mục (core/sceneParts.ts) + file media có / chưa có. */
+  private partsVm(step: 'anh' | 'video') {
+    const { ep, seg, scene } = this.nodes();
+    const rs = this.resolve();
+    if (!ep || !seg || !scene || !rs) return undefined;
+    const pf = seg.files['prompt'];
+    const text = pf && fs.existsSync(pf) ? fs.readFileSync(pf, 'utf8') : '';
+    const sec = text ? findSection(text, scene.code) : undefined;
+    const sp = sec ? splitScene(sec.text) : { head: '', intro: '', parts: [] };
+    const idx = mediaIndex(this.mediaDirs(rs).map((d) => d.dir));
+    const alias = this.studio.model!.config.project.scenePrompts?.aliasPrefixes ?? ['DON_', 'DC_'];
+    const img = (abs?: string) => (abs && /\.(png|jpe?g|webp|gif)$/i.test(abs) ? this.panel.webview.asWebviewUri(vscode.Uri.file(abs)).toString() : undefined);
+    const file = (name: string) => {
+      const abs = findMedia(idx, name, ep.id, alias);
+      return { name, abs, src: img(abs), found: !!abs };
+    };
+    const part = (x: (typeof sp.parts)[number]) => ({
+      title: x.title, kind: x.kind, status: x.status, line: (sec?.start ?? 0) + x.line,
+      body: x.text.split('\n').slice(1).join('\n'),
+      results: x.names.map(file),
+    });
+    // ảnh ⑨ đã lên kế hoạch (key frame + ảnh mạng) — tên trong tiêu đề tiểu mục
+    const planned = sp.parts.filter((x) => stepOf(x.kind) === 'anh' && x.status !== 'dropped').flatMap((x) => x.names.filter((n) => /^EP\d+_/.test(n)));
+    const base = { kind: step, scene: scene.code, ep: ep.id, file: pf ? this.studio.rel(pf) : undefined, line: sec?.start ?? 0, found: !!sec,
+      others: sp.parts.filter((x) => stepOf(x.kind) !== step).length, mediaRoot: this.studio.model?.mediaRoot, mediaFound: this.studio.model?.mediaFound };
+    const refs = (t: string) => {
+      const r = loadRefs(t, ep.id).map((x: LoadRef) => ({ ...x, ...file(x.name), own: x.scene === scene.code }));
+      return { chung: r.filter((x) => x.group === 'chung'), rieng: r.filter((x) => x.group === 'rieng') };
+    };
+    if (step === 'anh') {
+      const mine = sp.parts.filter((x) => stepOf(x.kind) === 'anh');
+      const renders = [...idx.keys()].filter((k) => k.startsWith(`${ep.id}_${scene.code}_R`)).sort().map(file);
+      const all = refs(mine.map((x) => x.text).join('\n'));
+      return { ...base, intro: sp.intro, renders, shared: all.chung,
+        web: mine.filter((x) => x.kind === 'web').map(part), items: mine.filter((x) => x.kind === 'anh').map((x) => ({ ...part(x), nap: refs(x.text) })) };
+    }
+    const mine = sp.parts.filter((x) => stepOf(x.kind) === 'video');
+    return { ...base, planned, items: mine.map((x) => {
+      const n = refs(x.text);
+      const loaded = new Set([...n.chung, ...n.rieng].map((r) => r.name));
+      return { ...part(x), nap: n, missing: x.kind === 'video' && x.status !== 'dropped' ? planned.filter((pl) => !loaded.has(pl)) : [] };
+    }) };
+  }
+
+  /** Các ô của cảnh bị ẩn ở lưới phân cảnh (sceneTable.gridHide: Ảnh · Video tham chiếu · Tham chiếu) — hiện ở tab cảnh. */
+  private sceneRow(file: string | undefined, code: string): { file: string; line: number; cells: { name: string; value: string }[] } | undefined {
+    const st = this.studio.model?.config.project.sceneTable;
+    if (!st || !file || !fs.existsSync(file) || !st.gridHide?.length) return undefined;
+    for (const t of parseTables(fs.readFileSync(file, 'utf8'))) {
+      const ci = columnIndex(t, st.codeColumn);
+      if (ci < 0) continue;
+      const r = t.rows.find((x) => (x.cells[ci] ?? '').replace(/[*~]/g, '').trim() === code);
+      if (!r) continue;
+      const cells = st.gridHide.map((name) => ({ name, i: columnIndex(t, name) })).filter((x) => x.i >= 0).map((x) => ({ name: x.name, value: (r.cells[x.i] ?? '').trim() }));
+      return cells.length ? { file: this.studio.rel(file), line: r.line, cells } : undefined;
+    }
+    return undefined;
+  }
+
+  /** Khóa bảng theo file đích hiện tại (lúc Nhận) — chỉ các bảng (cảnh · lời · tập); không phụ thuộc tab đang mở ở đối tượng nào. */
+  private lockNow(rs: ResolvedStep): ((proposed: string) => { text: string; restored: string[] }) | undefined {
+    const kind = rs.step.protect;
+    const model = this.studio.model;
+    if (!model || !rs.output?.exists || !(kind === 'scenes' || kind === 'lines' || kind === 'episodes' || kind === 'tik')) return undefined;
+    const p = model.config.project;
+    const done = [...(p.status.done ?? ['✅']), ...(p.status.dropped ?? [])];
+    let t: TableProtect | undefined;
+    if (kind === 'scenes') t = { codeColumn: p.sceneTable.codeColumn, codeRe: new RegExp(p.codes.scene), statusColumn: p.sceneTable.statusColumn, lockSymbols: done };
+    if (kind === 'lines') {
+      const L = p.linesTable ?? { codeColumn: 'Mã', statusColumn: 'Trạng thái' };
+      t = { codeColumn: L.codeColumn, codeRe: new RegExp(`^${p.codes.line}$`), statusColumn: L.statusColumn, lockSymbols: [...done, '✍'] };
+    }
+    if (kind === 'tik') { const T = tikSpec(p); t = { codeColumn: T.codeColumn, codeRe: TIK_CODE_RE, statusColumn: T.statusColumn, lockSymbols: done }; }
+    if (kind === 'episodes' && p.episodeList) t = { codeColumn: p.episodeList.codeColumn, codeRe: EPISODE_CODE_RE, statusColumn: p.episodeList.statusColumn, lockSymbols: p.status.done ?? ['✅'] };
+    if (!t) return undefined;
+    const tt = t;
+    const current = fs.readFileSync(rs.output.abs, 'utf8');
+    const codes = lockedRows(current, tt);
+    return codes.length ? (x) => protectTable(current, x, tt, codes) : undefined;
   }
 
   // ------------------------------------------------------------------ form ① ý tưởng + phong cách · ② kịch bản tóm tắt + danh sách tập
@@ -826,11 +948,12 @@ export class StepPanel {
       return { kind: 'outline', file: f?.rel, text: stripOutlineStatus(text), status: outlineStatus(text), next: rs?.step.next };
     }
     if (view.includes('outlines')) return this.outlinesVm();
+    if (view.includes('anh') || view.includes('video')) return this.partsVm(view.includes('anh') ? 'anh' : 'video');
     if (view.includes('prompts')) {
       const { ep, seg, scene } = this.nodes();
       if (!ep || !seg || !scene) return undefined;
       const b = scenePrompts(this.studio.root!, ep, seg.code, scene.code, p.scenePrompts);
-      return { kind: 'prompts', scene: scene.code, file: seg.files['prompt'] ? this.studio.rel(seg.files['prompt']) : undefined, own: b.scene, refs: b.refs };
+      return { kind: 'prompts', scene: scene.code, file: seg.files['prompt'] ? this.studio.rel(seg.files['prompt']) : undefined, own: b.scene, refs: b.refs, row: this.sceneRow(seg.files['canh'], scene.code) };
     }
     if (view.includes('render')) {
       const rs = this.resolve();
@@ -1144,7 +1267,7 @@ export class StepPanel {
     const ov = model && this.overview();
     const { ep, seg, scene } = this.nodes();
     if (!model || !ov?.approve || !ep) return;
-    const plan = planApprove(model, ov.approve.level, ep, seg, scene?.code, undo ? 'review' : 'done');
+    const plan = planApprove(model, ov.approve.level, ep, seg, scene?.code, undo ? 'todo' : 'done');
     if (!plan.changes.length) {
       vscode.window.showInformationMessage(`${ov.approve.label}: không có dòng nào cần đổi.`);
       return;
@@ -1157,14 +1280,14 @@ export class StepPanel {
     }
     const codes = plan.changes.map((c) => c.code);
     const ok = await vscode.window.showInformationMessage(
-      `${undo ? 'Bỏ duyệt' : 'Duyệt'} ${plan.label}: đổi trạng thái ${codes.length} dòng (${codes.slice(0, 12).join(', ')}${codes.length > 12 ? '…' : ''}) trong ${files.join(', ')}?`,
+      `${undo ? 'Xem lại (⬜ chưa duyệt)' : 'Duyệt'} ${plan.label}: đổi trạng thái ${codes.length} dòng (${codes.slice(0, 12).join(', ')}${codes.length > 12 ? '…' : ''}) trong ${files.join(', ')}?`,
       { modal: true },
-      undo ? 'Bỏ duyệt' : 'Duyệt',
+      undo ? 'Xem lại' : 'Duyệt',
     );
     if (!ok) return;
     const res = applyPlan(plan);
     vscode.window.showInformationMessage(
-      `${undo ? 'Đã bỏ duyệt' : 'Đã duyệt'} ${plan.label} (${codes.length - res.skipped.length} dòng)${res.skipped.length ? ` · bỏ qua ${res.skipped.join(', ')} (ô vừa bị sửa)` : ''}. Xem bằng git diff.`,
+      `${undo ? 'Đã đưa về ⬜ chưa duyệt' : 'Đã duyệt'} ${plan.label} (${codes.length - res.skipped.length} dòng)${res.skipped.length ? ` · bỏ qua ${res.skipped.join(', ')} (ô vừa bị sửa)` : ''}. Xem bằng git diff.`,
     );
     this.studio.refresh();
   }
@@ -1195,18 +1318,20 @@ export class StepPanel {
       <div id="editor"></div>
       <div id="gridHost" class="card" style="margin-top:8px" hidden>${GRID_BODY}</div>
       <div id="media"></div>
-      <div class="row" style="align-items:flex-start;gap:16px;margin-top:8px">
+      <details id="relBox" style="margin-top:8px"><summary id="relSum"><b>File liên quan</b></summary>
+      <div class="row" style="align-items:flex-start;gap:16px;margin-top:4px">
         <div class="col" style="flex:1 1 340px;min-width:280px">
-          <h2>File liên quan</h2><div id="files"></div>
-          <div id="tools"></div>
-          <div id="notes"></div>
-          <div id="scripts"></div>
+          <div id="files"></div>
         </div>
         <div class="col" style="flex:2 1 480px;min-width:300px">
           <h2 id="pvTitle">Xem nhanh <span class="muted">(bấm "xem" một file bên trái)</span></h2>
           <div id="pv" class="md"><p class="muted">—</p></div>
         </div>
       </div>
+      </details>
+      <div id="tools"></div>
+      <div id="notes"></div>
+      <div id="scripts"></div>
       <div id="ai">
         <h2>AI <button class="link" data-cmd="settings">cài đặt model</button></h2>
         <div class="row"><label>Model <select id="model"></select></label>
@@ -1238,7 +1363,7 @@ document.addEventListener('click', (e) => {
   const sb = e.target.closest('[data-step]');
   if (sb) vscode.postMessage({ type: 'selectStep', id: sb.dataset.step });
   const ab = e.target.closest('[data-approve]');
-  if (ab) vscode.postMessage({ type: 'approve', undo: ab.dataset.approve === 'undo' });
+  if (ab) vscode.postMessage({ type: 'approve', undo: ab.dataset.approve === 'undo', gridDirty: !!(window.gridDirty && window.gridDirty()) });
   if (e.target.closest('#logAttempt')) vscode.postMessage({ type: 'logAttempt', a: {
     variant: $('aVar').value, model: $('aModel').value, credit: $('aCredit').value, seconds: $('aSec').value,
     marks: [...document.querySelectorAll('.aMark')].map((x) => x.value), usable: $('aUse').value, note: $('aNote').value } });
@@ -1252,7 +1377,7 @@ window.addEventListener('message', (e) => {
   if (m.type === 'rendered') {
     $('pvTitle').innerHTML = esc(m.label) + (m.abs ? ' <button class="link" data-open="' + esc(m.abs) + '" data-line="' + m.line + '">sửa</button>'
       + '<button class="link" data-open="' + esc(m.abs) + '" data-how="preview">preview đầy đủ</button>' : '');
-    $('pv').innerHTML = m.html;
+    $('pv').innerHTML = m.html; $('relBox').open = true;
   }
 });
 
@@ -1300,8 +1425,12 @@ function renderEditor(ed) {
   edKey = key; edDirty = false;
   if (!ed) { $('editor').innerHTML = ''; return; }
   const dirtyMark = '<span id="edDirty" class="err"></span>';
+  if (ed.kind === 'anh' || ed.kind === 'video') { $('editor').innerHTML = partsHtml(ed); return; }
   if (ed.kind === 'prompts') {
     let h = '<h2>Prompt của cảnh ' + esc(ed.scene) + ' <span class="muted">' + (ed.own ? 'mục trong <a data-open="' + esc(ed.own.file) + '" data-line="' + ed.own.line + '">' + esc(ed.own.file) + '</a>' : '') + '</span></h2>';
+    // ô của cảnh không hiện ở lưới phân cảnh (Ảnh · Video tham chiếu · Tham chiếu)
+    if (ed.row) h += '<table id="sceneRow" style="margin-bottom:8px">' + ed.row.cells.map((c) => '<tr><th style="white-space:nowrap">' + esc(c.name) + '</th><td>' + (c.value ? inlineMd(c.value) : '<span class="muted">—</span>') + '</td></tr>').join('')
+      + '<tr><td colspan="2" class="muted">dòng ' + esc(ed.scene) + ' trong <a data-open="' + esc(ed.row.file) + '" data-line="' + ed.row.line + '">' + esc(ed.row.file) + '</a> — sửa ở đó (lưới phân cảnh không hiện các cột này)</td></tr></table>';
     h += ed.own ? '<div class="card">' + mdBlocks(ed.own.text, 'prompt ' + ed.scene) + '</div>' : '<p class="muted">Chưa có mục ' + esc(ed.scene) + ' trong ' + esc(ed.file || 'file prompt của phân đoạn') + ' — bấm Chạy ở mục AI để viết.</p>';
     if (ed.refs.length) h += '<h2>Ảnh tham chiếu cảnh này nạp <span class="muted">' + ed.refs.length + ' ảnh · prompt tìm trong tham-chieu/ của tập</span></h2>'
       + ed.refs.map((r) => '<div class="card" style="margin-top:6px"><b>@[' + esc(r.name) + ']</b>'
@@ -1322,9 +1451,9 @@ function renderEditor(ed) {
     window._secOrig = ed.text;
     $('editor').innerHTML = '<h2>Kịch bản của phân đoạn <span class="muted">' + (ed.file ? 'mục trong <a data-open="' + esc(ed.file) + '" data-line="' + ed.line + '">' + esc(ed.file) + '</a>' : '') + (ed.found ? '' : ' · chưa có mục này — lưu là thêm vào cuối file') + '</span></h2>'
       + '<p class="muted">Xác định nội dung chính của phân đoạn (ý đồ · cảnh trí · hành động · sử liệu · thời lượng). Lưu là ghi lại đúng mục này trong kịch bản chi tiết của tập.</p>'
-      + '<textarea id="secText" style="min-height:300px;font-family:var(--vscode-editor-font-family)">' + esc(splitNote(ed.text).body) + '</textarea>'
+      + '<textarea class="mdEd" id="secText" style="min-height:300px;font-family:var(--vscode-editor-font-family)">' + esc(splitNote(ed.text).body) + '</textarea>'
       + '<h3 style="margin:10px 0 4px">Ghi chú của phân đoạn <span class="muted">— ý sửa cho AI; bấm Tạo phân cảnh / Tạo phân đoạn là AI làm theo ghi chú (chỉ phần chưa duyệt)</span></h3>'
-      + '<textarea id="secNote" style="min-height:110px;font-family:var(--vscode-editor-font-family)" placeholder="vd. thêm cảnh … · bỏ … · rút ngắn …">' + esc(splitNote(ed.text).note) + '</textarea>'
+      + '<textarea class="mdEd" id="secNote" style="min-height:110px;font-family:var(--vscode-editor-font-family)" placeholder="vd. thêm cảnh … · bỏ … · rút ngắn …">' + esc(splitNote(ed.text).note) + '</textarea>'
       + '<div class="row" style="margin-top:6px"><button class="sec" id="saveSec">Lưu kịch bản phân đoạn</button>' + dirtyMark
       + (ed.next ? '<button id="secNext" title="lưu → sang bước sau → AI chạy luôn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu → sang ⑥ → AI chia cảnh (xem diff rồi Nhận, lưới cập nhật)</span>' : '') + '</div>';
     return;
@@ -1339,7 +1468,7 @@ function renderEditor(ed) {
     if (ed.cur) {
       h += '<h2 style="margin-top:14px">' + esc(ed.cur) + ' · ' + esc(ed.name) + ' <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a> · ' : '') + (ed.hasDir ? lab[ed.status] : '') + '</span></h2>';
       if (!ed.hasDir) h += '<p class="muted">Tập này chưa có thư mục — tạo ở <b>▦ Danh sách tập</b> (nút 📁) rồi viết dàn ý.</p>';
-      else h += '<textarea id="olAllText" data-ep="' + esc(ed.cur) + '" style="min-height:360px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+      else h += '<textarea class="mdEd" id="olAllText" data-ep="' + esc(ed.cur) + '" style="min-height:360px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
         + '<div class="row" style="margin-top:6px"><button class="sec" id="olAllSave">Lưu dàn ý</button>'
         + (ed.status === 'done' ? '<button class="sec" id="olAllUndo">Bỏ duyệt</button>' : '<button id="olAllAppr" title="lưu + đánh dấu dàn ý đã duyệt">✅ Duyệt dàn ý</button>') + dirtyMark
         + (ed.next ? '<button id="olAllNext" title="lưu dàn ý → mở tab tập ở ④ → AI chia phân đoạn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu → mở tab tập → AI chia phân đoạn (xem diff rồi Nhận)</span>' : '') + '</div>';
@@ -1349,7 +1478,7 @@ function renderEditor(ed) {
   }
   if (ed.kind === 'outline') {
     $('editor').innerHTML = '<h2>Dàn ý <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a>' : '') + (ed.status === 'done' ? ' · <span class="ok">✅ đã duyệt</span>' : '') + '</span></h2>'
-      + '<textarea id="olText" style="min-height:360px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+      + '<textarea class="mdEd" id="olText" style="min-height:360px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
       + '<div class="row" style="margin-top:6px"><button class="sec" id="saveOl">Lưu dàn ý</button>' + dirtyMark
       + (ed.next ? '<button id="olNext" title="lưu dàn ý → chuyển sang bước sau → AI chạy luôn">✨ ' + esc(ed.next.label) + '</button><span class="muted">lưu dàn ý → sang ④ → AI chia phân đoạn (xem diff rồi Nhận)</span>' : '') + '</div>';
     return;
@@ -1371,13 +1500,13 @@ function renderEditor(ed) {
           const opts = (f.choices || []).slice(); if (v && !opts.includes(v)) opts.unshift(v);
           input = '<select class="ideaF" data-k="' + k + '"><option value=""></option>' + opts.map((o) => '<option' + (o === v ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>'
             + ' <input class="ideaO" data-k="' + k + '" size="30" placeholder="hoặc gõ loại khác…">';
-        } else input = '<textarea class="ideaF" data-k="' + k + '" style="min-height:' + (f.hint && /dài/.test(f.hint) ? 200 : 110) + 'px">' + esc(v) + '</textarea>';
+        } else input = '<textarea class="ideaF mdEd" data-k="' + k + '" style="min-height:' + (f.hint && /dài/.test(f.hint) ? 200 : 110) + 'px">' + esc(v) + '</textarea>';
         return '<tr><th style="width:170px;vertical-align:top">' + esc(f.label) + (f.hint ? '<div class="muted" style="font-weight:normal">' + esc(f.hint) + '</div>' : '') + '</th><td>' + input + '</td></tr>';
       }).join('') + '</table><div class="row" style="margin-top:6px"><button id="saveIdea">Lưu ý tưởng + phong cách</button>' + dirtyMark + '</div>';
     return;
   }
   $('editor').innerHTML = '<h2>Kịch bản tóm tắt <span class="muted">' + (ed.file ? '<a data-open="' + esc(ed.file) + '">' + esc(ed.file) + '</a>' : 'chưa cấu hình synopsis trong project.yaml') + '</span></h2>'
-    + '<textarea id="synText" style="min-height:280px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
+    + '<textarea class="mdEd" id="synText" style="min-height:280px;font-family:var(--vscode-editor-font-family)">' + esc(ed.text) + '</textarea>'
     + '<div class="row" style="margin-top:6px"><button id="saveSyn">Lưu kịch bản tóm tắt</button>' + dirtyMark
     + (ed.runLabel ? '<button data-cmd="run" data-arg="" title="AI đọc ý tưởng + kịch bản tóm tắt + danh sách hiện tại → đề xuất danh sách tập mới; xem diff rồi Nhận">✨ ' + esc(ed.runLabel) + '</button><span class="muted">AI đề xuất → Xem diff → Nhận → sửa tiếp trong lưới</span>' : '') + '</div>'
     + '<p class="muted" style="margin-top:10px"><b>Chia tập</b>: AI giữ nguyên tập ✅ Duyệt · chia lại, viết lại tên + tóm tắt cho tập ⬜ Chưa duyệt · xóa tập ❌ Bỏ · viết tóm tắt cho tập chưa có → tool đánh lại TAP. '
@@ -1396,6 +1525,56 @@ function joinNote(body, note, code, head) {
 }
 function inlineMd(t) { return esc(t).replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>').replace(/\\x60([^\\x60]+)\\x60/g, '<code>$1</code>'); }
 let copyN = 0; const copyText = {};
+// ⑨ Tạo ảnh · ⑩ Tạo video (17/11/2026)
+function thumb(f, big) {
+  const h = big ? 120 : 64;
+  if (!f.found) return '<span class="badge" style="background:var(--vscode-inputValidation-warningBackground,#634)" title="chưa có file trong thư mục media">✗ ' + esc(f.name) + '</span>';
+  return '<span style="display:inline-flex;flex-direction:column;align-items:center;margin:2px 6px 2px 0">'
+    + (f.src ? '<img src="' + esc(f.src) + '" style="height:' + h + 'px;border-radius:3px;cursor:pointer" data-open="' + esc(f.abs) + '" data-how="preview" title="' + esc(f.name) + '">' : '<a data-open="' + esc(f.abs) + '" data-how="preview">▶ ' + esc(f.name) + '</a>')
+    + (f.src ? '<span class="muted" style="font-size:.8em">✓ ' + esc(f.name) + '</span>' : '') + '</span>';
+}
+function stBtns(x) {
+  const lab = { done: '<b class="ok">✅ đạt</b>', dropped: '❌ loại', todo: '⬜ chưa làm' }[x.status];
+  const b = (to, t, tip) => '<button class="link" data-pst="' + to + '" data-line="' + x.line + '" data-title="' + esc(x.title) + '" title="' + tip + '">' + t + '</button>';
+  return lab + ' ' + (x.status === 'done' ? b('todo', 'làm lại', 'về ⬜ — AI được viết lại') : x.status === 'dropped' ? b('todo', 'khôi phục', 'về ⬜') : b('done', 'đạt', '✅ — AI không viết lại') + b('dropped', 'loại', '❌ bỏ tiểu mục này'));
+}
+function napHtml(n, scene) {
+  const row = (lab, tip, xs) => '<tr><th style="white-space:nowrap;width:150px" title="' + tip + '">' + lab + '</th><td>' + (xs.length ? xs.map((r) => thumb(r) + (r.scene && r.scene !== scene ? '<span class="muted" style="font-size:.8em">(cảnh ' + esc(r.scene) + ')</span> ' : '')).join('') : '<span class="muted">—</span>') + '</td></tr>';
+  return '<table style="width:100%;margin:4px 0">' + row('Loại 1 · chung', 'ảnh tham chiếu làm sẵn ở cấp tập / dự án (@[TÊN], EPxx_REF_…)', n.chung) + row('Loại 2 · riêng', 'ảnh làm riêng cho phân đoạn — key frame, ảnh mạng, render của cảnh này hoặc cảnh khác trong tập', n.rieng) + '</table>';
+}
+function partCard(x, label, extra) {
+  const off = x.status === 'dropped';
+  return '<div class="card" style="margin-top:8px' + (off ? ';opacity:.55' : '') + '"><div class="row" style="justify-content:space-between"><b>' + inlineMd(x.title.replace(/^\\s*(?:[✅❌⬜]️?\\s*)+/u, '')) + '</b><span>' + stBtns(x) + '</span></div>'
+    + (extra || '') + (off ? '' : mdBlocks(x.body, label)) + '</div>';
+}
+function partsHtml(ed) {
+  const src = ed.file ? 'mục <a data-open="' + esc(ed.file) + '" data-line="' + ed.line + '">' + esc(ed.scene) + '</a> trong ' + esc(ed.file) : 'file prompt của phân đoạn';
+  const none = '<p class="muted">' + (ed.found ? 'Chưa có tiểu mục ' + (ed.kind === 'anh' ? 'ảnh' : 'video') : 'Chưa có mục ' + esc(ed.scene)) + ' trong ' + esc(ed.file || 'file prompt') + ' — bấm ✨ ở mục AI bên dưới để viết.</p>';
+  const media = ed.mediaFound ? '' : '<p class="warn">Chưa thấy thư mục media (' + esc(ed.mediaRoot || 'chưa đặt') + ') — mọi ảnh hiện ✗. Đặt ở Cài đặt AI → thư mục media.</p>';
+  if (ed.kind === 'anh') {
+    let h = '<h2>⑨ Tạo ảnh — key frame của ' + esc(ed.scene) + ' <span class="muted">' + src + '</span></h2>' + media;
+    if (ed.intro) h += '<div class="card">' + mdBlocks(ed.intro, 'cách làm ' + ed.scene) + '</div>';
+    h += '<h3>Nguồn vào</h3><table style="width:100%">'
+      + '<tr><th style="width:150px">🧊 Render Blender</th><td>' + (ed.renders.length ? ed.renders.map((f) => thumb(f)).join('') : '<span class="muted">chưa có ảnh render của cảnh — làm ở mục Blender của tập</span>') + '</td></tr>'
+      + '<tr><th>🖼 Tham chiếu chung</th><td>' + (ed.shared.length ? ed.shared.map((f) => thumb(f)).join('') : '<span class="muted">—</span>') + '</td></tr>'
+      + '<tr><th>🌐 Ảnh mạng</th><td>' + (ed.web.length ? ed.web.map((w) => w.results.map((f) => thumb(f)).join('') || esc(w.title)).join('') : '<span class="muted">AI chưa góp ý ảnh mạng nào</span>') + '</td></tr></table>';
+    if (ed.web.length) h += '<h3>🌐 Ảnh mạng cần tìm <span class="muted">— tải về, đặt tên đúng mã vào thư mục media; sửa hay không đều nạp cho video</span></h3>' + ed.web.map((w) => partCard(w, 'ảnh mạng ' + ed.scene, '<div>' + w.results.map((f) => thumb(f, true)).join('') + '</div>')).join('');
+    h += '<h3>🎞 Key frame</h3>' + (ed.items.length ? ed.items.map((x) => partCard(x, 'prompt ảnh ' + ed.scene, '<div>' + x.results.map((f) => thumb(f, true)).join('') + '</div>' + napHtml(x.nap, ed.scene))).join('') : none);
+    if (ed.others) h += '<p class="muted">' + ed.others + ' tiểu mục video của cảnh ở ⑩ Tạo video.</p>';
+    return h;
+  }
+  let h = '<h2>⑩ Tạo video — clip của ' + esc(ed.scene) + ' <span class="muted">' + src + '</span></h2>' + media;
+  if (ed.planned.length) h += '<p class="muted">Ảnh ⑨ đã lên kế hoạch: ' + ed.planned.map(esc).join(' · ') + '</p>';
+  h += ed.items.length ? ed.items.map((x) => partCard(x, 'prompt video ' + ed.scene, napHtml(x.nap, ed.scene)
+    + (x.missing.length ? '<p class="err">⚠ chưa nạp ảnh ⑨: ' + x.missing.map(esc).join(' · ') + '</p>' : '')
+    + (x.results.length ? '<div>' + x.results.map((f) => thumb(f)).join('') + '</div>' : ''))).join('') : none;
+  if (ed.others) h += '<p class="muted">' + ed.others + ' tiểu mục ảnh của cảnh ở ⑨ Tạo ảnh.</p>';
+  return h;
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('[data-pst]');
+  if (b) vscode.postMessage({ type: 'partStatus', line: Number(b.dataset.line), to: b.dataset.pst, title: b.dataset.title });
+});
 function mdBlocks(text, label) {
   const out = []; let buf = [], code = null;
   for (const l of String(text).split('\\n')) {
@@ -1474,7 +1653,7 @@ function renderTop(vm) {
   const links = o.links.map((l) => '<button class="link" data-cmd="' + esc(l.cmd) + '"' + (l.arg ? ' data-arg="' + esc(l.arg) + '"' : '') + '>' + esc(l.label) + '</button>').join('');
   let appr = '';
   if (o.approve) appr = o.approve.done
-    ? '<div class="col" style="align-items:flex-end"><span class="ok appr">✅ ' + esc(o.approve.label) + ' đã duyệt</span><button class="sec" data-approve="undo">Bỏ duyệt</button></div>'
+    ? '<div class="col" style="align-items:flex-end"><span class="ok appr">✅ ' + esc(o.approve.label) + ' đã duyệt</span><button class="sec" data-approve="undo" title="đưa về ⬜ chưa duyệt — AI được viết lại">Xem lại</button></div>'
     : '<button class="appr" data-approve="do" title="đổi trạng thái thành ✅ cho ' + esc(o.approve.label) + (o.approve.level === 'scene' ? '' : ' và mọi cảnh bên trong') + '">✅ Duyệt ' + esc(o.approve.label) + '</button>';
   $('overview').innerHTML = '<div class="ov"><div style="flex:1 1 400px"><div class="crumbs muted">' + crumbs + '</div><h1 style="margin:2px 0">' + esc(o.title) + '</h1>'
     + '<div class="facts">' + facts + '</div><div style="margin-top:4px">' + links + '</div></div>' + appr + '</div>';
@@ -1515,6 +1694,11 @@ function render(vm) {
   gridOn = gk;
 
   const sh = vm.files.filter((f) => f.shared);
+  const own = vm.files.filter((f) => !f.shared);
+  const bad = own.filter((f) => !f.virtual && ((!f.exists && !f.optional) || (f.exists && !f.found))).length;
+  $('relSum').innerHTML = '<b>File liên quan</b> <span class="muted">· ' + own.length + ' file' + (sh.length ? ' + ' + sh.length + ' tài liệu chung' : '')
+    + ' — bấm để ' + ($('relBox').open ? 'gấp lại' : 'xem, sửa') + '</span>' + (bad ? ' <span class="err">· ⚠ ' + bad + ' thiếu / không thấy mục</span>' : '');
+  $('relBox').ontoggle = () => { const m = document.querySelector('#relSum .muted'); if (m) m.textContent = m.textContent.replace(/bấm để .*$/, 'bấm để ' + ($('relBox').open ? 'gấp lại' : 'xem, sửa')); };
   $('files').innerHTML = '<table>' + vm.files.filter((f) => !f.shared).map((f) => {
     const state = f.virtual ? '<span class="muted">' + f.chars + ' ký tự</span>'
       : !f.exists ? (f.optional ? '<span class="muted">không có</span>' : '<span class="err">chưa có</span>')

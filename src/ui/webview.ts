@@ -43,6 +43,10 @@ code { font-family: var(--vscode-editor-font-family); }
 .md { border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 0 14px; max-height: 70vh; overflow: auto; }
 .md table { font-size: .92em; }
 .scroll-x { overflow-x: auto; }
+.mdBar { display: flex; justify-content: flex-end; gap: 4px; margin: 2px 0; }
+.mdBar button.on { font-weight: bold; text-decoration: underline; }
+.mdView { border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 0 14px; min-height: 40px; overflow: auto; }
+.mdView:empty::before { content: '(trống — bấm Sửa để viết)'; color: var(--vscode-descriptionForeground); }
 `;
 
 export function shell(webview: vscode.Webview, title: string, body: string, script = ''): string {
@@ -65,11 +69,56 @@ document.addEventListener('click', (e) => {
   if (!el) return;
   e.preventDefault();
   if (el.dataset.open) vscode.postMessage({ type: 'open', path: el.dataset.open, line: Number(el.dataset.line || 0), how: el.dataset.how || 'edit' });
-  else vscode.postMessage({ type: 'cmd', cmd: el.dataset.cmd, arg: el.dataset.arg });
+  else vscode.postMessage({ type: 'cmd', cmd: el.dataset.cmd, arg: el.dataset.arg, gridDirty: !!(window.gridDirty && window.gridDirty()) });
 });
+${MD_TOGGLE_JS}
 ${script}
 </script></body></html>`;
 }
+
+/** Ô soạn markdown (textarea class "mdEd"): tự gắn nút 👁 Xem / ✏ Sửa (17/11/2026). Xem = hiện markdown (host render bằng bộ của VS Code,
+ *  tin 'mdRender' → 'mdHtml'); Sửa = ô chữ như cũ. Chữ đang sửa dở vẫn nằm trong ô (ẩn khi xem) — Lưu như thường. Bấm đúp vào phần xem = sang Sửa.
+ *  Chế độ nhớ theo ô (id / data-k) trong phiên của tab; mặc định Xem. */
+const MD_TOGGLE_JS = `(function () {
+const MODE = {}; let N = 0;
+const key = (t) => (t.id || 'md') + ':' + (t.dataset.k || t.dataset.ep || '');
+function show(t, mode) {
+  const bar = t.previousElementSibling, view = t.nextElementSibling;
+  MODE[key(t)] = mode;
+  bar.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.md === mode));
+  if (mode === 'view') {
+    t.style.display = 'none'; view.style.display = '';
+    view.style.minHeight = Math.min(parseInt(t.style.minHeight) || 64, 300) + 'px';
+    vscode.postMessage({ type: 'mdRender', id: t.dataset.mdId, text: t.value });
+  } else { view.style.display = 'none'; t.style.display = ''; t.dispatchEvent(new Event('mdshow')); }
+}
+function decorate(root) {
+  const all = root.matches && root.matches('textarea.mdEd:not([data-md-id])') ? [root] : root.querySelectorAll ? [...root.querySelectorAll('textarea.mdEd:not([data-md-id])')] : [];
+  all.forEach((t) => {
+    t.dataset.mdId = String(++N);
+    const bar = document.createElement('div'); bar.className = 'mdBar';
+    bar.innerHTML = '<button class="link" data-md="view" title="hiện markdown đã định dạng">👁 Xem</button><button class="link" data-md="edit" title="sửa chữ markdown">✏ Sửa</button>';
+    const view = document.createElement('div'); view.className = 'mdView'; view.title = 'bấm đúp để sửa';
+    t.parentNode.insertBefore(bar, t); t.parentNode.insertBefore(view, t.nextSibling);
+    show(t, MODE[key(t)] || 'view');
+  });
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('.mdBar [data-md]'); if (!b) return;
+  const t = b.parentNode.nextElementSibling; if (t && t.tagName === 'TEXTAREA') { show(t, b.dataset.md); if (b.dataset.md === 'edit') t.focus(); }
+});
+document.addEventListener('dblclick', (e) => {
+  const v = e.target.closest && e.target.closest('.mdView'); if (!v || e.target.closest('a,[data-open]')) return;
+  const t = v.previousElementSibling; if (t && t.tagName === 'TEXTAREA') { show(t, 'edit'); t.focus(); }
+});
+window.addEventListener('message', (e) => {
+  const m = e.data; if (!m || m.type !== 'mdHtml') return;
+  const t = document.querySelector('textarea[data-md-id="' + m.id + '"]');
+  if (t && t.nextElementSibling) t.nextElementSibling.innerHTML = t.value.trim() ? m.html : '';
+});
+new MutationObserver((ms) => ms.forEach((x) => x.addedNodes.forEach((n) => n.nodeType === 1 && decorate(n)))).observe(document.body, { childList: true, subtree: true });
+decorate(document);
+})();`;
 
 /** Render markdown bằng chính bộ render của VS Code, biến link tương đối và `đường/dẫn` thành link mở file. */
 export async function renderMarkdown(studio: Studio, text: string, baseFile: string): Promise<string> {

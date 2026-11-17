@@ -1,4 +1,5 @@
 // Ghép ngữ cảnh cho một bước: giải đường dẫn, kiểm cổng, dựng prompt, ước tính token, ghép kết quả vào file.
+import { mergeScenePart } from './sceneParts';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -126,17 +127,25 @@ function checkGate(model: ProjectModel, step: StepSpec, ph: Placeholders): GateR
     const file = path.join(model.config.root, fill(g.table.file, ph));
     const row = fill(g.table.row, ph);
     let status: StatusKey | undefined;
+    let cell = '';
     if (fs.existsSync(file)) {
       const text = fs.readFileSync(file, 'utf8');
       const t = findTable(text, [g.table.column]);
       if (t) {
         const ci = columnIndex(t, g.table.column);
         const r = t.rows.find((r) => r.cells.some((c) => stripMd(c) === row));
-        if (r) status = parseStatus(r.cells[ci] ?? '', model.config.project.status);
+        if (r) {
+          cell = stripMd(r.cells[ci] ?? '').trim();
+          status = parseStatus(r.cells[ci] ?? '', model.config.project.status);
+        }
       }
     }
     if (status !== g.require) {
-      reasons.push(`${row} ở ${fill(g.table.file, ph)} đang "${status ? STATUS_LABEL[status] : 'không rõ'}", cần "${STATUS_LABEL[g.require]}"`);
+      // 17/11/2026: nói rõ ô nào, đang ghi gì, mở cổng thế nào (trước: "B ở …README.md đang "chưa làm", cần "duyệt"")
+      const who = g.label ? fill(g.label, ph) : row;
+      const shown = cell ? `"${cell.length > 40 ? cell.slice(0, 40) + '…' : cell}"` : 'trống / không thấy dòng';
+      reasons.push(`${who} chưa ${STATUS_LABEL[g.require]} — ô ${g.table.column} trong ${fill(g.table.file, ph)} đang ghi ${shown}`
+        + ` (tool đọc là "${status ? STATUS_LABEL[status] : 'không rõ'}")${g.hint ? '. ' + fill(g.hint, ph) : ''}`);
     }
   }
   return { ok: reasons.length === 0, reasons };
@@ -233,6 +242,11 @@ export function mergeOutput(rs: ResolvedStep, newContent: string): string {
   const mode = rs.step.output?.mode ?? 'replace';
   if (mode === 'replace' || !out.ref.select?.startsWith('heading:')) return newContent;
   const sec = findSection(full, out.ref.select.slice('heading:'.length));
+  const part = rs.step.output?.part;
+  if (part) {                                         // ⑨ / ⑩: chỉ phần Ảnh / Video, giữ phần kia + tiểu mục ✅ / ❌
+    const m = mergeScenePart(sec?.text, newContent, part).text;
+    return sec ? replaceSection(full, sec, m) : (full.replace(/\s*$/, '') + '\n\n' + m).replace(/^\s+/, '');
+  }
   if (mode === 'insert' && sec) {
     // chèn ngay dưới tiêu đề mục, sau các dòng trống / trích dẫn '>' đi liền tiêu đề
     const lines = full.split(/\r?\n/);

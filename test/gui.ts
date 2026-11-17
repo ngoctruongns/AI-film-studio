@@ -202,9 +202,13 @@ async function main() {
   ok(step.$('#stepper .st.cur')?.dataset.step === 'chia-canh', 'bấm ô dashboard → tab phân đoạn K, chọn sẵn ④');
   await waitFor(() => step.$$('#files tr').length >= 2, `bảng file: ${step.$$('#files tr').length} dòng`);
   ok(/tài liệu dùng chung/.test(step.$('#files details summary')?.textContent ?? ''), `tài liệu dùng chung gấp lại: ${step.$('#files details summary')?.textContent}`);
-  ok(step.$('#head')!.textContent!.includes('Cổng chưa mở'), 'cổng đóng (README K chưa ✅)');
+  ok(step.$('#head')!.textContent!.includes('Cổng chưa mở') && /Kịch bản phân đoạn K chưa duyệt — ô Trạng thái trong .*README.md đang ghi/.test(step.$('#head')!.textContent!), `cổng đóng (README K chưa ✅): ${step.$('#head .warn')?.textContent?.slice(0, 160)}`);
   ok(step.$('#est')!.textContent!.includes('token'), `ước tính: ${step.$('#est')!.textContent}`);
+  // 17/11/2026 (Trường): "File liên quan" gấp thành một dòng — bấm mới sổ ra; dòng gấp vẫn báo số file + file thiếu
+  ok(!(step.$('#relBox') as HTMLDetailsElement).open && /File liên quan · \d+ file/.test(step.$('#relSum')?.textContent ?? ''), `File liên quan gấp lại: ${step.$('#relSum')?.textContent}`);
   (step.$('#files [data-cmd="show"]') as HTMLElement).click();
+  await step.settle();
+  ok((step.$('#relBox') as HTMLDetailsElement).open, 'bấm "xem" → mục File liên quan tự mở ra');
   await step.settle();
   await waitFor(() => step.$('#pv .rendered'), 'xem nhanh file đầu vào');
   const run = step.$('#actions [data-cmd="run"]')!;
@@ -288,8 +292,18 @@ async function main() {
   await grid.settle();
   await waitFor(() => grid.$$('#grid tr').length > 5, `lưới: ${grid.$$('#grid tr').length - 1} cảnh`);
   ok(grid.$$('#grid col').length > 3 && grid.$$('#grid [data-rz]').length > 3, 'cột có tay kéo đổi độ rộng');
-  const stSel = grid.$$('#grid select');
-  ok(stSel.length > 0 && [...(stSel[0] as HTMLSelectElement).options].some((o) => o.value === '✅'), `ô Trạng thái = danh sách chọn (${stSel.length} ô)`);
+  { const hs = grid.$$('#grid th').map((th) => (th.textContent ?? '').trim());
+    ok(!hs.includes('Ảnh') && !hs.includes('Tham chiếu') && !hs.includes('Video tham chiếu'), `lưới phân cảnh ẩn Ảnh · Video tham chiếu · Tham chiếu (${hs.filter(Boolean).join(', ')})`); }
+  // 16/11/2026: lưới cảnh — duyệt / xem lại ở cột đầu, cột Trạng thái chỉ hiển thị
+  ok(grid.$$('#grid select:not([data-l])').length === 0 && grid.$$('#grid [data-a="ok"]').length > 0, `nút duyệt / xem lại ở cột đầu, không còn ô chọn trạng thái (${grid.$$('#grid [data-a="ok"]').length} nút)`);
+  const ok0 = () => grid.$('[data-a="ok"][data-r="0"]') as HTMLElement;
+  const was = ok0().textContent;
+  ok0().click();
+  await grid.settle();
+  ok(ok0().textContent !== was && /chưa lưu/.test(grid.$('#gDirty')?.textContent ?? ''), `bấm "${was}" → "${ok0().textContent}" · ● chưa lưu`);
+  ok0().click();
+  await grid.settle();
+  ok(ok0().textContent === was, `bấm lại → "${was}"`);
   const before = fs.readFileSync(kFile, 'utf8');
   const nRows = grid.$$('#grid tr').length - 1;
   const secInput = grid.$$('#grid input').find((i) => i.dataset.r === '2' && i.dataset.c === '1') as HTMLInputElement;
@@ -306,27 +320,79 @@ async function main() {
   ok(after.includes(newCode) && /K1[2-9]/.test(newCode), `file có cảnh mới ${newCode}`);
   ok(after.split('\n').length === before.split('\n').length + 1, 'chỉ thêm đúng 1 dòng, phần chữ khác giữ nguyên');
   ok(/\|\s*\*\*K03\*\*\s*\|\s*7\s*\|/.test(after), 'sửa giây K03 = 7');
+  // 17/11/2026: cột Lời / thoại — câu của K_loi.md ghép theo cảnh; bỏ cảnh → câu ⛔ theo cảnh
+  await waitFor(() => grid.$$('#grid th').some((th) => (th.textContent ?? '').startsWith('Lời / thoại')), 'cột Lời / thoại ngay cạnh Hình');
+  // 17/11/2026: lưới mở ở 👁 Xem — ô Hình + lời hiện markdown; ✏ Sửa → ô chữ
+  ok(grid.$$('#grid .gmd b').length > 0 && !grid.$('#grid textarea'), '👁 Xem: ô Hình / lời hiện đậm, không có ô chữ');
+  // 17/11/2026 (Trường): ở 👁 Xem bấm MỘT lần vào ô Hình là sửa được ngay ô đó · cột thao tác đủ rộng, nút duyệt không bị cột Mã che
+  ok(Number((grid.$('#grid col') as HTMLElement)?.style.width.replace('px', '')) >= 110 && grid.$('#grid td.act'), `cột thao tác rộng ${(grid.$('#grid col') as HTMLElement)?.style.width}, nút xuống dòng được`);
+  const gm0 = grid.$('#grid .gmd[data-er]') as HTMLElement;
+  const gmR = gm0.dataset.er!, gmC = gm0.dataset.ec!;
+  gm0.click();
+  await grid.settle();
+  const ge = grid.$('#grid textarea.gedit') as HTMLTextAreaElement;
+  ok(!!ge && ge.dataset.r === gmR && grid.$$('#grid .gmd').length > 0, 'bấm ô Hình (👁 Xem) → riêng ô đó thành ô gõ, ô khác vẫn xem');
+  ge.value = ge.value + ' · sửa bằng một cú bấm';
+  ge.dispatchEvent(new grid.dom!.window.Event('input', { bubbles: true }));
+  ge.dispatchEvent(new grid.dom!.window.FocusEvent('focusout', { bubbles: true }));
+  await grid.settle();
+  ok(!grid.$('#grid textarea.gedit') && /sửa bằng một cú bấm/.test((grid.$(`#grid .gmd[data-er="${gmR}"][data-ec="${gmC}"]`) as HTMLElement)?.textContent ?? ''), 'rời ô → về dạng xem, giữ chữ vừa gõ');
+  (grid.$('#gSave') as HTMLElement).click();
+  await grid.settle();
+  ok(/sửa bằng một cú bấm/.test(fs.readFileSync(kFile, 'utf8')), 'Lưu → chữ sửa ở chế độ xem ghi vào file');
+  (grid.$('#gView') as HTMLElement).click();
+  await grid.settle();
+  ok(grid.$$('#grid textarea').length > 0 && !grid.$('#grid .gmd'), '✏ Sửa: ô Hình / lời thành ô chữ');
+  const kLoiF = path.join(path.dirname(kFile), 'K_loi.md');
+  const lnTa = grid.$$('#grid textarea[data-lf="text"]');
+  ok(lnTa.length > 0, `câu lời hiện trong lưới cảnh (${lnTa.length} câu)`);
+  const trs = grid.$$('#grid tr');
+  const lri = trs.indexOf(lnTa[0].closest('tr') as HTMLElement) - 1;
+  const lsc = (grid.$$('#grid input').find((i) => i.dataset.r === String(lri) && i.dataset.c === '0') as HTMLInputElement).value.replace(/[*~]/g, '').trim();
+  (grid.$('[data-la="add"]') as HTMLElement).click();
+  await grid.settle();
+  const fresh = grid.$$('#grid textarea[data-lf="text"]').find((t) => (t as HTMLTextAreaElement).value === '') as HTMLTextAreaElement;
+  fresh.value = 'Câu dẫn thêm từ lưới cảnh';
+  fresh.dispatchEvent(new grid.dom!.window.Event('input', { bubbles: true }));
+  (grid.$(`[data-a="drop"][data-r="${lri}"]`) as HTMLElement).click();
+  await grid.settle();
+  ok(grid.$$('#grid tr')[lri + 1].querySelectorAll('[data-la="mv"]').length > 0, `bỏ cảnh ${lsc} → câu của cảnh có nút chuyển sang cảnh bên cạnh`);
+  (grid.$('#gSave') as HTMLElement).click();
+  await grid.settle();
+  const kLoi2 = fs.readFileSync(kLoiF, 'utf8');
+  ok(kLoi2.includes('Câu dẫn thêm từ lưới cảnh') && new RegExp(`${lsc}_L\\d+ \\|[^\\n]*⛔ bỏ theo ${lsc}`).test(kLoi2), `lưu → câu mới + câu của ${lsc} "⛔ bỏ theo ${lsc}" vào K_loi.md`);
+  (grid.$(`[data-a="drop"][data-r="${lri}"]`) as HTMLElement).click();
+  (grid.$('#gSave') as HTMLElement).click();
+  await grid.settle();
+  ok(!fs.readFileSync(kLoiF, 'utf8').includes(`⛔ bỏ theo ${lsc}`), `khôi phục ${lsc} → câu trở lại trạng thái cũ`);
 
-  console.log('\n[7] Cảnh: ⑨ Prompt ảnh + video · ⑩ Blender (chỉ file render _R)');
-  fs.writeFileSync(path.join(media, 'EP01_K02_R1_I0.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
-  V.commands.executeCommand('aiFilmStudio.openStep', 'blender', { ep: 'EP01', seg: 'K', scene: 'K02' });
+  console.log('\n[7] Cảnh: ⑨ Tạo ảnh · ⑩ Tạo video (17/11/2026)');
+  fs.writeFileSync(path.join(media, 'EP01_F06_R1_I0.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+  V.commands.executeCommand('aiFilmStudio.openStep', 'anh', { ep: 'EP01', seg: 'F', scene: 'F06' });
+  await sleep(50);
   const kq = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
   await kq.settle();
-  ok(kq.$$('#stepper .st').map((x) => x.dataset.step).join(',') === 'prompt,blender', `sơ đồ bước cảnh: ${kq.$$('#stepper .st').map((x) => x.textContent).join(' → ')}`);
-  await waitFor(() => kq.$$('#media .card').length === 1, `⑩ media K02: chỉ ${kq.$$('#media .card').length} file render (bỏ ảnh / video AI)`);
-  ok(kq.$('#media img')?.getAttribute('src')?.startsWith('vscode-resource:'), 'ảnh render hiện qua asWebviewUri');
-  ok(!kq.$('[data-cmd="import"]') && !kq.$('#saveResult'), 'không còn nút nhập file / ghi kết quả');
-  V.commands.executeCommand('aiFilmStudio.openStep', 'prompt', { ep: 'EP01', seg: 'F', scene: 'F03' });
-  await sleep(50);
-  const pf = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
-  await pf.settle();
-  await waitFor(() => pf.$('#editor [data-copy]'), '⑨ F03: prompt của cảnh có nút 📋 chép');
-  ok(/Đại quân Minh dàn trận/.test(pf.$('#editor')!.textContent ?? ''), 'hiện khối prompt video F03');
-  const refCards = pf.$$('#editor .card').filter((c) => c.querySelector('b')?.textContent === '@[DON_VANTHE]');
-  ok(refCards.length === 1 && /cũng dùng ở/.test(refCards[0].textContent ?? ''), `ảnh dùng chung @[DON_VANTHE]: ${(refCards[0]?.textContent ?? '').slice(0, 90)}`);
-  (pf.$('#editor [data-copy]') as HTMLElement).click();
-  await pf.settle();
-  ok(/^Thực hiện video/.test(V.clipboard.text ?? ''), `📋 chép → clipboard: ${(V.clipboard.text ?? '').slice(0, 40)}`);
+  ok(kq.$$('#stepper .st').map((x) => x.dataset.step).join(',') === 'anh,video', `sơ đồ bước cảnh: ${kq.$$('#stepper .st').map((x) => x.textContent).join(' → ')}`);
+  await waitFor(() => /⑨ Tạo ảnh/.test(kq.$('#editor')?.textContent ?? ''), '⑨ F06: tab Tạo ảnh');
+  const ed9 = kq.$('#editor')!;
+  ok(/Render Blender/.test(ed9.textContent ?? '') && !!ed9.querySelector('img[src^="vscode-resource:"]'), '⑨ nguồn vào: ảnh render EP01_F06_R1_I0 hiện ảnh nhỏ');
+  ok(ed9.querySelectorAll('[data-pst="done"]').length === 2 && !/【Cảnh 1】/.test(ed9.textContent ?? ''), `⑨ chỉ 2 key frame, không có prompt video`);
+  ok(/Loại 1 · chung/.test(ed9.textContent ?? '') && /EP01_REF_DC_LINH_MINH/.test(ed9.textContent ?? ''), '⑨ ảnh nạp chia 2 loại');
+  (ed9.querySelector('[data-pst="done"]') as HTMLElement).click();
+  await kq.settle(10);
+  const fPrompt = path.join(root, '04_PRODUCTION/EPISODES/EP01/phan-doan/F_tran-da-bang/F_prompt.md');
+  ok(/### ✅ Ảnh 1 · `EP01_F06_R1_I0`/.test(fs.readFileSync(fPrompt, 'utf8')), 'bấm "đạt" → tiêu đề "### ✅ Ảnh 1 …" trong F_prompt.md');
+  await waitFor(() => /✅ đạt/.test(kq.$('#editor')?.textContent ?? ''), '⑨ hiện ✅ đạt');
+  (kq.$('[data-step="video"]') as HTMLElement).click();
+  await kq.settle();
+  await waitFor(() => /⑩ Tạo video/.test(kq.$('#editor')?.textContent ?? ''), '⑩ F06: tab Tạo video');
+  const ed10 = kq.$('#editor')!;
+  const rows = [...ed10.querySelectorAll('tr')].map((r) => r.textContent ?? '');
+  ok(rows.some((r) => /Loại 1 · chung/.test(r) && /EP01_REF_DON_DOI_THANG/.test(r)) && rows.some((r) => /Loại 2 · riêng/.test(r) && /EP01_F06_R1_I0/.test(r)), '⑩ ảnh nạp: chung = REF của tập · riêng = ảnh của cảnh');
+  ok(!/⚠ chưa nạp/.test(ed10.textContent ?? ''), '⑩ video nạp đủ ảnh ⑨');
+  (ed10.querySelector('[data-copy]') as HTMLElement).click();
+  await kq.settle();
+  ok(/^@EP01_F06_R1_I0 là khung hình đầu/.test(V.clipboard.text ?? ''), `📋 chép prompt video → ${(V.clipboard.text ?? '').slice(0, 40)}`);
 
   console.log('\n[9] Lệnh quản lý');
   V.answers.push({ kind: 'info', value: 'Ghi' });
@@ -399,11 +465,10 @@ async function main() {
   ok(/^Vẽ lại tấm @13_van_the_sheet_khong_chu/.test(V.clipboard.text ?? '') && !(V.clipboard.text ?? '').includes('@<PHOTO>'), `📋 chép prompt sheet → ${(V.clipboard.text ?? '').slice(0, 60)}`);
   const pTh = bp.$$('#refs tr.prow').find((r) => r.previousElementSibling?.children[0]?.textContent === 'REF_THANH_DABANG_R1')!;
   ok(pTh?.textContent!.includes('Biến render @EP01_REF_THANH_DABANG_R1'), 'prompt ảnh thành Đa Bang');
-  V.commands.executeCommand('aiFilmStudio.openStep', 'blender', { ep: 'EP01', seg: 'F', scene: 'F02' });
+  V.commands.executeCommand('aiFilmStudio.openStep', 'video', { ep: 'EP01', seg: 'F', scene: 'F02' });
   const bs = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
   await bs.settle();
   await waitFor(() => bs.$('#head')!.textContent!.includes('CAM_F02'), 'tab ⑥a F02 có thẻ Blender');
-  ok(bs.$('#files')!.textContent!.includes('Blender của F02'), 'đầu vào ảo "Blender của F02" cho Claude Code');
   const sp = V.panels.find((p) => p.viewType === 'aiFilmStudio.settings')!;
   (sp.$('[data-cmd="testBlender"]') as HTMLElement).click();
   await sp.settle(10);
@@ -445,7 +510,7 @@ async function main() {
   const jp = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
   await jp.settle();
   await waitFor(() => jp.$('[data-approve="do"]')?.textContent?.includes('cảnh J02'), 'tab cảnh J02: nút "✅ Duyệt cảnh J02"');
-  ok(jp.$$('#stepper .st').length === 2 && jp.$('#stepper .st.cur')?.dataset.step === 'prompt', `sơ đồ bước cảnh: ${jp.$$('#stepper .st').map((b) => b.textContent).join(' → ')}`);
+  ok(jp.$$('#stepper .st').length === 2 && jp.$('#stepper .st.cur')?.dataset.step === 'anh', `sơ đồ bước cảnh: ${jp.$$('#stepper .st').map((b) => b.textContent).join(' → ')}`);
   V.answers.push({ kind: 'info', value: 'Duyệt' });
   (jp.$('[data-approve="do"]') as HTMLElement).click();
   await jp.settle(10);
@@ -453,11 +518,11 @@ async function main() {
   const diff = jAfter.split('\n').filter((l, i) => l !== jBefore.split('\n')[i]);
   ok(diff.length === 1 && diff[0].includes('J02') && /✅/.test(diff[0]), 'duyệt cảnh → chỉ đúng 1 dòng J02 đổi');
   await jp.settle();
-  await waitFor(() => jp.$('[data-approve="undo"]'), 'cảnh J02 hiện "Bỏ duyệt"');
-  V.answers.push({ kind: 'info', value: 'Bỏ duyệt' });
+  await waitFor(() => jp.$('[data-approve="undo"]')?.textContent === 'Xem lại', 'cảnh J02 hiện "Xem lại"');
+  V.answers.push({ kind: 'info', value: 'Xem lại' });
   (jp.$('[data-approve="undo"]') as HTMLElement).click();
   await jp.settle(10);
-  ok(/J02[^\n]*👀 chờ duyệt/.test(fs.readFileSync(jFile, 'utf8')), 'bỏ duyệt → 👀 chờ duyệt');
+  ok(/\*\*J02\*\*[^\n]*\| ⬜[^|]*\|\s*$/m.test(fs.readFileSync(jFile, 'utf8')), 'xem lại → ⬜ chưa duyệt');
 
   console.log('\n[13] Trạng thái · Tài nguyên · Ý tưởng – phong cách · danh sách tập');
   const r0 = tree.getChildren().slice(0, 4).map((n: any) => tree.getTreeItem(n).label);
@@ -538,6 +603,22 @@ async function main() {
   const listTxt = fs.readFileSync(path.join(root, '04_PRODUCTION/DANH-SACH-TAP.md'), 'utf8');
   ok(/\*\*EP02\*\* \| TAP01/.test(listTxt) && listTxt.includes(`${epNew} | ↑ TAP02`) && /\*\*EP01\*\* \| TAP02/.test(listTxt), `lưu → file có EP02=TAP01, EP01=TAP02, ${epNew}=↑ TAP02`);
   await waitFor(() => eg.$$('[data-a="mkdir"]').length === 2, `sau khi lưu: ${epNew} có nút 📁 tạo thư mục`);
+
+  console.log('\n[13a] Tập: ⑪ Tik — lưới tik.md (D-36, 17/11/2026)');
+  V.commands.executeCommand('aiFilmStudio.openStep', 'tik', { ep: 'EP01' });
+  await sleep(50);
+  const tk = V.panels.filter((p) => p.viewType === 'aiFilmStudio.step').pop()!;
+  await tk.settle();
+  ok(tk.$$('#stepper .st').map((x) => x.dataset.step).includes('tik'), `sơ đồ bước của tập có ⑪ Tik: ${tk.$$('#stepper .st').map((x) => x.dataset.step).join(',')}`);
+  await waitFor(() => tk.$$('#grid tr').length === 8, `lưới tik EP01: ${tk.$$('#grid tr').length - 1} dòng`);
+  ok(/Trận Đa Bang/.test(tk.$('#grid')?.textContent ?? '') || [...tk.$$('#grid input, #grid textarea')].some((x) => (x as HTMLInputElement).value === 'Trận Đa Bang'), 'lưới có tik "Trận Đa Bang"');
+  (tk.$('[data-a="add"][data-r="6"]') as HTMLElement).click();
+  await tk.settle(10);
+  const tkCodes = [...tk.$$('#grid tr')].slice(1).map((r) => (r.querySelector('input') as HTMLInputElement)?.value ?? r.textContent);
+  ok(tkCodes.some((c) => /TIK8/.test(c ?? '')), `thêm tik → mã kế tiếp TIK8 (${tkCodes.join(' ')})`);
+  (tk.$('#gSave') as HTMLElement).click();
+  await tk.settle(10);
+  ok(/\| TIK8 \|/.test(fs.readFileSync(path.join(root, '04_PRODUCTION/EPISODES/EP01/tik.md'), 'utf8')), 'lưu → tik.md có dòng TIK8');
 
   console.log('\n[13b] Dự án: ③ Dàn ý mọi tập — chọn tập, sửa, duyệt');
   ok(!pp.$('[data-step="ket-thuc-phien"]'), 'không còn bước Kết thúc phiên');
@@ -625,6 +706,12 @@ async function main() {
   await waitFor(() => /\[K\]/.test((kt.$('#secText') as HTMLTextAreaElement)?.value ?? ''), `⑤ hiện mục [K] của kịch bản: ${kt.$$('#stepper .st').map((x) => x.textContent).join(' → ')}`);
   ok(kt.$('#gridHost')!.hidden, '⑤ chưa hiện lưới');
   ok(kt.$('#secNote') && !/### Ghi chú/.test((kt.$('#secText') as HTMLTextAreaElement).value), `⑤ ô Ghi chú riêng: "${((kt.$('#secNote') as HTMLTextAreaElement)?.value ?? '').slice(0, 40)}"`);
+  // 17/11/2026: ô soạn markdown mặc định 👁 Xem (markdown đã định dạng) · ✏ Sửa = ô chữ
+  const secTa = kt.$('#secText') as HTMLTextAreaElement;
+  await waitFor(() => /\[K\]/.test((secTa.nextElementSibling as HTMLElement)?.innerHTML ?? ''), '⑤ kịch bản phân đoạn mở ở chế độ 👁 Xem — markdown đã định dạng');
+  ok(secTa.style.display === 'none' && kt.$$('.mdBar').length >= 2, `ô chữ ẩn khi xem · ${kt.$$('.mdBar').length} ô có nút Xem / Sửa (kịch bản + ghi chú)`);
+  (secTa.previousElementSibling!.querySelector('[data-md="edit"]') as HTMLElement).click();
+  ok(secTa.style.display === '' && (secTa.nextElementSibling as HTMLElement).style.display === 'none', '✏ Sửa → hiện ô chữ, ẩn phần xem');
   (kt.$('#secText') as HTMLTextAreaElement).value += '\n- ý mới của phân đoạn K';
   (kt.$('#secNext') as HTMLElement).click();
   await kt.settle(10);
@@ -651,6 +738,7 @@ async function main() {
   await kt.settle(10);
   const added = (kt.$('#gridHost #grid input[data-r="1"][data-c="0"]') as HTMLInputElement).value.replace(/[*~]/g, '');
   ok(added.startsWith(firstCode.split('_')[0] + '_L') && added !== firstCode, `+ dưới ${firstCode} → câu mới cùng cảnh ${added}`);
+  if (/Sửa/.test(kt.$('#gView')?.textContent ?? '')) { (kt.$('#gView') as HTMLElement).click(); await kt.settle(); }   // lưới mở ở 👁 Xem
   const wordIdx = kt.$$('#gridHost #grid th').findIndex((t) => /^Lời/.test(t.textContent ?? '')) - 1;
   const ta = kt.$(`#gridHost #grid textarea[data-r="1"][data-c="${wordIdx}"]`) as HTMLTextAreaElement;
   ta.value = 'Câu thoại thử nghiệm.';

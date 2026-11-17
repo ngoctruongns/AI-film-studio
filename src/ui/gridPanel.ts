@@ -68,6 +68,8 @@ export class GridPanel {
 export class GridController {
   private grid?: Grid;
   private spec?: GridSpec;
+  /** bảng lời <X>_loi.md đi kèm lưới cảnh — cột "Lời / thoại" (17/11/2026) */
+  private lines?: { file: string; grid: Grid };
 
   constructor(
     private studio: Studio,
@@ -75,12 +77,37 @@ export class GridController {
     private ep: string | undefined,
     private seg: string | undefined,
     /** lines = bảng lời <X>_loi.md của phân đoạn (bước ⑦) */
-    private kind: 'scenes' | 'lines' | 'episodes' = 'scenes',
+    private kind: 'scenes' | 'lines' | 'episodes' | 'tik' = 'scenes',
   ) {}
 
   private makeSpec(): GridSpec | string {
     const model = this.studio.model!;
     const p = model.config.project;
+    if (this.kind === 'tik') {
+      // ⑪ Tik (D-36): bảng tik của tập — EPISODES/<tập>/tik.md, mã TIK1…TIK9
+      const ep = findEpisode(model, this.ep);
+      if (!ep) return 'Chưa chọn tập.';
+      const T = tikSpec(model.config.project);
+      const file = path.join(ep.dir, T.file);
+      if (!fs.existsSync(file)) fs.writeFileSync(file, emptyTikTable(ep.id, T), 'utf8');
+      return {
+        file,
+        title: `Tik ${ep.id} — ${this.studio.rel(file)}`,
+        codeColumn: T.codeColumn,
+        codeRe: TIK_CODE_RE,
+        nameColumn: T.nameColumn,
+        secondsColumn: T.secondsColumn,
+        statusColumn: T.statusColumn,
+        statusChoices: T.statusChoices,
+        columnWidths: T.columnWidths,
+        noun: 'tik',
+        newCode: (taken) => {
+          const used = taken.map((c) => /^TIK(\d+)$/.exec(c.replace(/[*`~]/g, '').trim())?.[1]).filter(Boolean).map(Number);
+          const n = (used.length ? Math.max(...used) : 0) + 1;
+          return n <= 9 ? `TIK${n}` : undefined;
+        },
+      };
+    }
     if (this.seg && this.kind === 'lines') {
       const s = findSegment(findEpisode(model, this.ep), this.seg);
       const file = s?.files['loi'];
@@ -199,12 +226,35 @@ export class GridController {
     const si = col(spec.statusColumn);
     if (si >= 0 && !lists[si]) lists[si] = Object.values(p.status).flat();
     const defaults = { ...DEFAULT_WIDTHS, ...spec.columnWidths };
+    this.lines = undefined;
+    let linesVm: any;
+    if (this.kind === 'scenes' && this.seg) {
+      const lf = findSegment(findEpisode(this.studio.model, this.ep), this.seg)?.files['loi'];
+      const L = p.linesTable ?? { codeColumn: 'Mã', nameColumn: 'Lời', statusColumn: 'Trạng thái' };
+      const lg = lf && fs.existsSync(lf) ? readGrid(fs.readFileSync(lf, 'utf8'), L.codeColumn, new RegExp(`^${p.codes.line}$`)) : undefined;
+      if (lf && lg) {
+        this.lines = { file: lf, grid: lg };
+        const li = (n: string) => lg.headers.findIndex((h) => h.toLowerCase() === n.toLowerCase());
+        linesVm = {
+          file: this.studio.rel(lf),
+          headers: lg.headers,
+          codeIndex: lg.codeIndex,
+          oldIndex: li('Mã cũ'),
+          typeIndex: li('Loại'),
+          speakerIndex: li('Người nói'),
+          textIndex: li(L.nameColumn ?? 'Lời'),
+          noteIndex: li('Ghi chú'),
+          statusIndex: li(L.statusColumn ?? 'Trạng thái'),
+          rows: lg.rows,
+        };
+      }
+    }
     this.post({
       type: 'grid',
       title: spec.title,
       file: spec.file,
       noun: spec.noun,
-      plainCode: spec.noun === 'câu',
+      plainCode: spec.noun === 'câu' || spec.noun === 'tik',
       headers,
       codeIndex: this.grid.codeIndex,
       wideIndex: col(spec.nameColumn),
@@ -215,11 +265,17 @@ export class GridController {
       // lịch phát hành (cột chỉ đọc cuối lưới tập): TAP firstEpisode ra ngày firstDate, mỗi tập cách everyDays
       schedule: spec.noun === 'tập' ? p.release : undefined,
       dropSymbol: p.status.dropped?.[0] ?? '❌',
+      doneSymbol: p.status.done?.[0] ?? '✅',
+      todoSymbol: p.status.todo?.[0] ?? '⬜',
+      seg: this.kind === 'scenes' ? this.seg : undefined,
+      // cột ẩn ở lưới cảnh (giữ nguyên trong file khi lưu) — sceneTable.gridHide
+      hide: this.kind === 'scenes' && this.seg ? (p.sceneTable.gridHide ?? []).map((n) => col(n)).filter((i) => i >= 0) : [],
       statusChoices: spec.statusChoices,
       widths: { ...defaults, ...this.studio.context.globalState.get<Record<string, number>>(WIDTH_KEY, {}) },
       defaults,
       lists,
       rows: this.grid.rows,
+      lines: linesVm,
     });
   }
 
@@ -286,13 +342,48 @@ export class GridController {
           }
           saveLedger(lp, ledger);
         }
+        // lời của cảnh (cột "Lời / thoại") → ghi về <X>_loi.md, xếp theo thứ tự cảnh
+        let linesMsg = '';
+        if (this.lines && Array.isArray(m.lines) && m.linesDirty) {
+          const lf = this.lines.file;
+          const lnow = fs.readFileSync(lf, 'utf8');
+          if (lnow !== this.lines.grid.original) {
+            const ok = await vscode.window.showWarningMessage(`${path.basename(lf)} đã bị sửa ở chỗ khác từ lúc mở lưới. Ghi đè lời bằng bản trong lưới?`, { modal: true }, 'Ghi đè lời', 'Tải lại lưới');
+            if (ok === 'Tải lại lưới') return this.load();
+            if (ok !== 'Ghi đè lời') return;
+            const L = this.studio.model!.config.project.linesTable ?? { codeColumn: 'Mã' };
+            const fresh = readGrid(lnow, L.codeColumn, new RegExp(`^${this.studio.model!.config.project.codes.line}$`));
+            if (!fresh) return;
+            this.lines.grid = fresh;
+          }
+          const lrows: GridRow[] = (m.lines as GridRow[]).map((r) => ({ line: Number(r.line), cells: r.cells.map(String) }));
+          const lcodes = lrows.map((r) => stripMd(r.cells[this.lines!.grid.codeIndex] ?? '').replace(/~/g, '').trim());
+          const ldup = lcodes.find((c, i) => c && lcodes.indexOf(c) !== i);
+          if (ldup) return void vscode.window.showErrorMessage(`Mã câu ${ldup} bị trùng trong ${path.basename(lf)}.`);
+          const order = rows.map((r) => r.cells[ci]?.replace(/[*~]/g, '').trim() ?? '');
+          fs.writeFileSync(lf, writeGrid(this.lines.grid, sortLinesByScenes(lrows, this.lines.grid.codeIndex, order)), 'utf8');
+          linesMsg = ` + lời ${path.basename(lf)}`;
+        }
         fs.writeFileSync(file, writeGrid(this.grid, rows), 'utf8');
-        vscode.window.showInformationMessage(`Đã lưu ${this.seg ? 'bảng cảnh ' + this.seg : 'danh sách tập'} (${rows.length} dòng). Xem bằng git diff.`);
+        vscode.window.showInformationMessage(`Đã lưu ${this.seg ? 'bảng cảnh ' + this.seg : 'danh sách tập'} (${rows.length} dòng)${linesMsg}. Xem bằng git diff.`);
         this.studio.refresh();
         return this.load();
       }
     }
   }
+}
+
+/** Xếp câu lời theo thứ tự cảnh trong bảng cảnh (thứ tự dòng của <X>_loi.md = thứ tự phim). Trong một cảnh giữ thứ tự cũ;
+ *  câu mang mã cảnh không có trong bảng (vd. <X>00_L…) đi liền sau câu đứng trước nó. */
+export function sortLinesByScenes(rows: GridRow[], codeIndex: number, sceneOrder: string[]): GridRow[] {
+  let last = -1;
+  const keyed = rows.map((r, i) => {
+    const sc = /^([A-Z]\d{2})_L/.exec(stripMd(r.cells[codeIndex] ?? '').replace(/~/g, '').trim())?.[1] ?? '';
+    const k = sceneOrder.indexOf(sc);
+    if (k >= 0) last = k;
+    return { r, i, k: k >= 0 ? k : last };
+  });
+  return keyed.sort((a, b) => a.k - b.k || a.i - b.i).map((x) => x.r);
 }
 
 /** Sau khi Nhận bản "Chia tập" của AI: xóa dòng ❌ bỏ, cấp mã cho dòng MỚI, đánh lại số phát hành. Mã bị xóa vẫn giữ trong sổ mã. */
@@ -333,6 +424,29 @@ export function finalizeEpisodeList(studio: Studio): { removed: string[]; added:
 /** Sau khi Nhận bản AI của ⑥ / ⑦: tool cấp mã cho dòng mới — AI không tự đánh mã (Trường 30/10/2026).
  *  scenes: ô Mã không phải mã cảnh (vd. "MỚI") → mã cảnh kế tiếp chưa dùng theo sổ mã (mã đã bỏ không dùng lại).
  *  lines: ô Mã "<cảnh>_L?" / "<cảnh>_LMỚI" / "<cảnh>_L" → số câu kế tiếp của cảnh đó. Trả danh sách mã vừa cấp. */
+/** Mã tik: TIK1…TIK9 (có thể bọc `…` hoặc **…**) */
+export const TIK_CODE_RE = /^[`*]*TIK\d[`*]*$/;
+
+export function tikSpec(p: any) {
+  const T = p.tikTable ?? {};
+  return {
+    file: T.file ?? 'tik.md',
+    codeColumn: T.codeColumn ?? 'Mã',
+    nameColumn: T.nameColumn ?? 'Tên phần',
+    secondsColumn: T.secondsColumn ?? '~Giây',
+    statusColumn: T.statusColumn ?? 'Trạng thái',
+    statusChoices: T.statusChoices ?? [{ value: '✅', label: 'Duyệt' }, { value: '⬜', label: 'Chưa duyệt' }, { value: '❌', label: 'Bỏ' }],
+    columnWidths: T.columnWidths ?? { Mã: 64, 'Phân đoạn': 90, 'Cảnh': 120, '~Giây': 64, 'Tên phần': 240, 'Ghi chú': 420, 'Trạng thái': 120 },
+  };
+}
+
+function emptyTikTable(ep: string, T: ReturnType<typeof tikSpec>): string {
+  return `# Tik — ${ep} · đoạn cắt cho TikTok / Facebook / Shorts *(D-36)*\n\n`
+    + `> Cắt từ bản dựng của tập, theo ranh giới phân đoạn (1 tik = 1–2 phân đoạn), giữ 16:9. Giây = ước tính, chốt sau khi dựng.\n\n`
+    + `| ${T.codeColumn} | Phân đoạn | Cảnh | ${T.secondsColumn} | ${T.nameColumn} | Ghi chú | ${T.statusColumn} |\n|---|---|---|---|---|---|---|\n`
+    + `| TIK1 |  |  |  |  |  | ⬜ |\n`;
+}
+
 export function finalizeCodes(studio: Studio, ep: string, seg: string, kind: 'scenes' | 'lines'): string[] {
   const model = studio.model;
   const s = model && findSegment(findEpisode(model, ep), seg);
@@ -416,12 +530,12 @@ export async function createEpisodeDir(studio: Studio, code: string, title: stri
 
 const WIDTH_KEY = 'aiFilmStudio.gridWidths';
 /** độ rộng mặc định (px) — cột ngắn hẹp, cột chữ dài rộng; người kéo đổi được */
-const DEFAULT_WIDTHS: Record<string, number> = { Mã: 70, Frame: 96, Giây: 56, Hình: 460, Cỡ: 150, Góc: 150, Máy: 170, Cách: 160, 'Video tham chiếu': 150, 'Trạng thái': 130 };
+const DEFAULT_WIDTHS: Record<string, number> = { 'Lời / thoại': 380, Mã: 70, Frame: 96, Giây: 56, Hình: 460, Cỡ: 150, Góc: 150, Máy: 170, Cách: 160, 'Video tham chiếu': 150, 'Trạng thái': 130 };
 
 export const GRID_BODY = `
 <div class="row" style="justify-content:space-between"><h1 id="gTitle">Bảng cảnh</h1>
-<div class="row"><button id="gSave">Lưu</button><button class="sec" id="gReload">Tải lại</button><button class="link" id="gOpen">mở file</button></div></div>
-<p class="muted">Sửa thẳng trong ô · <b>kéo mép phải tiêu đề cột</b> để đổi độ rộng (nhớ cho lần sau; bấm đúp mép = về mặc định) · ▲▼ đổi thứ tự <span class="noun">chiếu</span> · <b>+</b> thêm <span class="noun">cảnh</span> mới ngay dưới (tool cấp mã kế tiếp chưa dùng) · <b>bỏ</b> đánh dấu trạng thái bỏ (không xóa dòng — mã đã cấp không dùng lại)<span id="relHelp"></span>.
+<div class="row"><button class="sec" id="gView" title="👁 xem: ô Hình + lời hiện markdown (đậm, nghiêng…) · ✏ sửa: ô chữ để gõ — ở chế độ xem, bấm vào một ô là sửa ngay ô đó">✏ Sửa</button><button class="sec" id="gLines" hidden title="cột Lời / thoại — lời dẫn + thoại của từng cảnh, đọc / ghi file <X>_loi.md">ẩn lời</button><button id="gSave">Lưu</button><button class="sec" id="gReload">Tải lại</button><button class="link" id="gOpen">mở file</button></div></div>
+<p class="muted">Sửa thẳng trong ô · <b>kéo mép phải tiêu đề cột</b> để đổi độ rộng (nhớ cho lần sau; bấm đúp mép = về mặc định) · ▲▼ đổi thứ tự <span class="noun">chiếu</span> · <b>+</b> thêm <span class="noun">cảnh</span> mới ngay dưới (tool cấp mã kế tiếp chưa dùng) · <b>duyệt</b> / <b>xem lại</b> đổi trạng thái ngay ở cột đầu (cột Trạng thái chỉ hiển thị) · <b>bỏ</b> đánh dấu trạng thái bỏ (không xóa dòng — mã đã cấp không dùng lại)<span id="relHelp"></span>.
 <span id="sum"></span> <span id="gDirty" class="err"></span></p>
 <div id="gErr"></div>
 <style>
@@ -429,6 +543,16 @@ export const GRID_BODY = `
 #grid th { position: relative; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #grid td input, #grid td textarea, #grid td select { width: 100%; box-sizing: border-box; }
 #grid .rz { position: absolute; top: 0; right: 0; width: 7px; height: 100%; cursor: col-resize; }
+#grid .ln { border-left: 3px solid var(--vscode-textLink-foreground); padding: 2px 0 4px 6px; margin-bottom: 6px; }
+#grid .ln.off { border-left-color: var(--vscode-disabledForeground); opacity: .55; }
+#grid .ln.dlg { border-left-color: var(--vscode-charts-orange, orange); }
+#grid .ln .hd { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 90%; margin-bottom: 2px; }
+#grid .ln .hd select { width: auto; }
+#grid .ln .hd input { width: 130px; }
+#grid .gmd { white-space: pre-wrap; cursor: text; min-height: 1.4em; }
+#grid .gmd:hover { outline: 1px dashed var(--vscode-focusBorder); }
+#grid td.act { white-space: normal; overflow: hidden; line-height: 1.7; }
+#grid td.act .link { margin-right: 4px; }
 #grid .rz:hover, #grid .rz.on { background: var(--vscode-focusBorder); }
 </style>
 <div class="scroll-x"><table id="grid"></table></div>
@@ -446,6 +570,14 @@ window.gridDirty = () => dirty;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 let G = null; let rows = []; let dirty = false;
+// cột "Lời / thoại" (17/11/2026): câu của <X>_loi.md ghép theo mã cảnh — LN = cấu hình bảng lời, lrows = các câu, ldirty = lời đã đổi
+let LN = null; let lrows = []; let ldirty = false; let SHOWL = true; let DN = [];
+// 👁 xem / ✏ sửa (17/11/2026): GV = true → ô Hình + câu lời hiện markdown, bấm đúp = sang sửa
+let GV = true;
+/** độ rộng cột thao tác (▲▼ + bỏ duyệt …) — 17/11/2026: 92 px làm nút duyệt tràn sang cột Mã */
+const AW = 118;
+function imd(t) { return esc(t).replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>').replace(/~~([^~]+)~~/g, '<s>$1</s>').replace(/(^|[^*\\w])\\*([^*\\s][^*]*?)\\*/g, '$1<i>$2</i>').replace(/\\x60([^\\x60]+)\\x60/g, '<code>$1</code>'); }
+const gvBtn = () => { $('gView').textContent = GV ? '✏ Sửa' : '👁 Xem'; };
 const mark = () => { dirty = true; $('gDirty').textContent = '● chưa lưu'; sum(); };
 const isDropped = (r) => G.statusIndex >= 0 && String(r.cells[G.statusIndex] || '').includes(G.dropSymbol);
 const codeOf = (r) => String(r.cells[G.codeIndex] || '').replace(/[*~]/g, '').trim();
@@ -461,7 +593,9 @@ window.addEventListener('message', (e) => {
   if (m.type === 'error') { $('gErr').innerHTML = '<p class="err">' + esc(m.text) + '</p>'; }
   if (m.type === 'grid') { G = m;
     document.querySelectorAll('.noun').forEach((x, i) => (x.textContent = i === 0 ? (m.noun === 'tập' ? 'phát hành' : 'chiếu') : m.noun));
-    $('relHelp').innerHTML = m.release ? ' · cột <b>' + esc(m.headers[m.release.index] || '') + '</b> tool tự đánh theo thứ tự dòng, bỏ qua tập ' + m.release.skip.map(esc).join(' ') + ' · <b>⤴</b> gộp vào tập phát hành dòng trên (1 TAP nhiều EP), <b>⤵</b> tách ra · <b>📁</b> tạo thư mục cho tập chưa có · <b>🗑</b> xóa hẳn tập ❌ bỏ (mã không dùng lại)' : ''; rows = m.rows.map((r) => ({ line: r.line, cells: r.cells.slice() })); dirty = false; $('gDirty').textContent = ''; $('gTitle').textContent = m.title; render(); }
+    $('relHelp').innerHTML = m.release ? ' · cột <b>' + esc(m.headers[m.release.index] || '') + '</b> tool tự đánh theo thứ tự dòng, bỏ qua tập ' + m.release.skip.map(esc).join(' ') + ' · <b>⤴</b> gộp vào tập phát hành dòng trên (1 TAP nhiều EP), <b>⤵</b> tách ra · <b>📁</b> tạo thư mục cho tập chưa có · <b>🗑</b> xóa hẳn tập ❌ bỏ (mã không dùng lại)' : ''; rows = m.rows.map((r) => ({ line: r.line, cells: r.cells.slice() })); dirty = false;
+    LN = m.lines || null; lrows = LN ? LN.rows.map((r) => ({ line: r.line, cells: r.cells.slice() })) : []; ldirty = false;
+    $('gLines').hidden = !LN; $('gLines').textContent = SHOWL ? 'ẩn lời' : 'hiện lời'; $('gDirty').textContent = ''; $('gTitle').textContent = m.title; render(); }
   if (m.type === 'newCode') {
     const cells = G.headers.map(() => '');
     cells[G.codeIndex] = G.plainCode ? m.code : '**' + m.code + '**';
@@ -496,31 +630,98 @@ function fit(t) {
   if (!t || t.tagName !== 'TEXTAREA') return;
   t.style.height = 'auto';
   const k = rows[+t.dataset.r] ? codeOf(rows[+t.dataset.r]) : '';
-  t.style.height = Math.max(56, t.scrollHeight + 4, TH[k] || 0) + 'px';
+  t.style.height = Math.max(t.dataset.l !== undefined ? 30 : 56, t.scrollHeight + 4, TH[k] || 0) + 'px';
 }
 function fitAll() { document.querySelectorAll('#grid textarea').forEach(fit); }
+// duyệt nhanh ở cột đầu (16/11/2026): lưới có lựa chọn ✅ → cột Trạng thái chỉ hiển thị; 3 trạng thái ⬜ chưa duyệt · ✅ đã duyệt · ❌ bỏ
+const AP = () => !!G.seg && G.statusIndex >= 0 && G.statusChoices.some((o) => o.value === G.doneSymbol);
+const isDone = (r) => String(r.cells[G.statusIndex] || '').includes(G.doneSymbol);
+const LEAD = /^(?:[⬜✍👀✅⏸🧪❌⛔]\uFE0F?\\s*)+/u;
+function stLabel(c, dropped) {
+  const rest = String(c || '').replace(LEAD, '').trim();
+  const b = dropped ? '❌ Bỏ' : String(c || '').includes(G.doneSymbol) ? '<b>✅ Đã duyệt</b>' : '⬜ Chưa duyệt';
+  return b + (rest ? ' <span class="muted">' + esc(rest) + '</span>' : '');
+}
+function setOk(r, ok) { const rest = String(r.cells[G.statusIndex] || '').replace(LEAD, '').trim(); r.cells[G.statusIndex] = ((ok ? G.doneSymbol : G.todoSymbol) + ' ' + rest).trim(); }
+// ---- lời của cảnh
+const markL = () => { ldirty = true; mark(); };
+const lcode = (l) => String(l.cells[LN.codeIndex] || '').replace(/[*~]/g, '').trim();
+const lst = (l) => String(l.cells[LN.statusIndex] || '');
+const lOff = (l) => /^\\s*[⛔❌]/u.test(lst(l));
+const linesOf = (sc) => lrows.map((l, i) => i).filter((i) => lcode(lrows[i]).startsWith(sc + '_L'));
+const DROPPED_L = /^\\s*⛔\\s*bỏ(?:\\s+theo\\s+[A-Z]\\d{2})?\\s*·\\s*/u;
+function lRestore(l) { const c = lst(l); l.cells[LN.statusIndex] = DROPPED_L.test(c) ? c.replace(DROPPED_L, '') : '⬜ nháp'; }
+function lDrop(l, by) { l.cells[LN.statusIndex] = '⛔ bỏ' + (by ? ' theo ' + by : '') + ' · ' + (lst(l).trim() || '⬜ nháp'); }
+function nextLine(sc) { return sc + '_L' + (lrows.reduce((a, l) => { const x = new RegExp('^' + sc + '_L(\\\\d+)$').exec(lcode(l)); return x ? Math.max(a, +x[1]) : a; }, 0) + 1); }
+// cảnh gần nhất chưa bỏ, về trước (-1) hoặc về sau (+1)
+function near(ri, d) { for (let i = ri + d; i >= 0 && i < rows.length; i += d) if (!isDropped(rows[i])) return codeOf(rows[i]); return ''; }
+function moveLine(li, to, fwd) {
+  const l = lrows[li], old = lcode(l);
+  if (DROPPED_L.test(lst(l)) || lOff(l)) lRestore(l);
+  if (LN.oldIndex >= 0) { const o = String(l.cells[LN.oldIndex] || '').trim(); l.cells[LN.oldIndex] = old + (o && o !== '—' ? ' · ' + o : ''); }
+  l.cells[LN.codeIndex] = nextLine(to);
+  lrows.splice(li, 1);
+  const at = linesOf(to);
+  if (!at.length) lrows.push(l); else if (fwd) lrows.splice(at[0], 0, l); else lrows.splice(at[at.length - 1] + 1, 0, l);
+}
+function linesCell(r, ri, dropped) {
+  const sc = codeOf(r);
+  const idx = linesOf(sc);
+  const types = ['lời dẫn', 'thoại', 'lặng'];
+  const prev = near(ri, -1), next = near(ri, 1);
+  return '<td>' + idx.map((li) => {
+    const l = lrows[li], off = lOff(l), t = String(l.cells[LN.typeIndex] || '').trim(), st = lst(l);
+    const mine = /^\\s*✍/u.test(st);
+    const opts = (types.includes(t) ? types : [t].concat(types)).map((x) => '<option' + (x === t ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
+    let hd = '<span class="muted">' + esc(lcode(l)) + '</span>';
+    if (off) hd += ' <span title="' + esc(st) + '">⛔ bỏ</span> <button class="link" data-la="undrop" data-l="' + li + '">khôi phục</button>';
+    else {
+      if (LN.typeIndex >= 0) hd += '<select data-l="' + li + '" data-lf="type">' + opts + '</select>';
+      if (LN.speakerIndex >= 0 && t === 'thoại') hd += '<input data-l="' + li + '" data-lf="speaker" placeholder="người nói" value="' + esc(l.cells[LN.speakerIndex]) + '">';
+      hd += '<button class="link" data-la="st" data-l="' + li + '" title="' + esc(st) + '">' + (mine ? '✍ của anh' : '⬜ nháp') + '</button>';
+      hd += '<button class="link" data-la="drop" data-l="' + li + '" title="bỏ câu này (⛔)">bỏ</button>';
+    }
+    if (dropped) hd += (prev ? '<button class="link" data-la="mv" data-l="' + li + '" data-to="' + prev + '" title="chuyển câu sang cảnh trước — câu nhận mã mới, mã cũ ghi ở cột Mã cũ">← ' + prev + '</button>' : '')
+      + (next ? '<button class="link" data-la="mv" data-l="' + li + '" data-to="' + next + '" data-fwd="1" title="chuyển câu sang cảnh sau — câu nhận mã mới, mã cũ ghi ở cột Mã cũ">→ ' + next + '</button>' : '');
+    const body = off ? '<div style="text-decoration:line-through">' + esc(l.cells[LN.textIndex]) + '</div>'
+      : t === 'lặng' ? '<div class="muted">(lặng)</div>'
+      : GV ? '<div class="gmd" data-el="' + li + '" title="bấm để sửa">' + imd(l.cells[LN.textIndex]) + '</div>'
+      : '<textarea data-l="' + li + '" data-lf="text" style="min-height:30px;overflow:hidden">' + esc(l.cells[LN.textIndex]) + '</textarea>';
+    const note = !off && LN.noteIndex >= 0 && String(l.cells[LN.noteIndex] || '').trim() ? '<div class="muted" style="font-size:85%">' + esc(l.cells[LN.noteIndex]) + '</div>' : '';
+    return '<div class="ln' + (off ? ' off' : t === 'thoại' ? ' dlg' : '') + '"><div class="hd">' + hd + '</div>' + body + note + '</div>';
+  }).join('') + (dropped ? '' : '<button class="link" data-la="add" data-sc="' + esc(sc) + '" title="thêm câu lời dẫn / thoại cho cảnh này (mã ' + esc(sc) + '_L kế tiếp)">+ câu</button>') + '</td>';
+}
 function render() {
   const sy = window.scrollY, sx = document.querySelector('.scroll-x'), sl = sx ? sx.scrollLeft : 0;
   renumber();
   $('lists').innerHTML = Object.entries(G.lists).map(([i, vals]) => '<datalist id="dl' + i + '">' + vals.map((v) => '<option value="' + esc(v) + '">').join('') + '</datalist>').join('');
   const W = (h) => G.widths[h] || 140;
   const SW = G.schedule ? 120 : 0;
-  $('grid').style.width = (92 + SW + G.headers.reduce((a, h) => a + W(h), 0)) + 'px';
-  $('grid').innerHTML = '<colgroup><col style="width:92px">' + G.headers.map((h) => '<col style="width:' + W(h) + 'px">').join('') + (SW ? '<col style="width:' + SW + 'px">' : '') + '</colgroup>'
-    + '<tr><th></th>' + G.headers.map((h, i) => '<th title="' + esc(h) + '">' + esc(h) + '<div class="rz" data-rz="' + i + '"></div></th>').join('') + (SW ? '<th>Lịch</th>' : '') + '</tr>' + rows.map((r, ri) => {
+  // cột hiển thị: các cột của bảng + cột ảo "Lời / thoại" ngay sau cột Hình
+  const DC = [];
+  G.headers.forEach((h, i) => { if ((G.hide || []).includes(i)) return; DC.push({ name: h, ci: i }); if (LN && SHOWL && i === G.wideIndex) DC.push({ name: 'Lời / thoại', v: true }); });
+  DN = DC.map((d) => d.name);
+  $('grid').style.width = (AW + SW + DN.reduce((a, h) => a + W(h), 0)) + 'px';
+  $('grid').innerHTML = '<colgroup><col style="width:' + AW + 'px">' + DN.map((h) => '<col style="width:' + W(h) + 'px">').join('') + (SW ? '<col style="width:' + SW + 'px">' : '') + '</colgroup>'
+    + '<tr><th></th>' + DN.map((h, i) => '<th title="' + esc(DC[i].v ? 'lời dẫn + thoại của cảnh — ' + LN.file : h) + '">' + esc(h) + '<div class="rz" data-rz="' + i + '"></div></th>').join('') + (SW ? '<th>Lịch</th>' : '') + '</tr>' + rows.map((r, ri) => {
     const dropped = G.statusIndex >= 0 && String(r.cells[G.statusIndex]).includes(G.dropSymbol);
-    return '<tr' + (dropped ? ' style="opacity:.5"' : '') + '><td style="white-space:nowrap">'
+    return '<tr' + (dropped ? ' style="opacity:.5"' : '') + '><td class="act">'
       + '<button class="link" data-a="up" data-r="' + ri + '">▲</button><button class="link" data-a="down" data-r="' + ri + '">▼</button>'
       + '<button class="link" data-a="add" data-r="' + ri + '" title="thêm dòng mới dưới dòng này (tool cấp mã)">+</button>'
       + (G.statusIndex >= 0 ? '<button class="link" data-a="drop" data-r="' + ri + '">' + (dropped ? 'khôi phục' : 'bỏ') + '</button>' : '')
+      + (AP() && !dropped ? (isDone(r) ? '<button class="link" data-a="ok" data-r="' + ri + '" title="đưa về ⬜ chưa duyệt — AI được viết lại cảnh này">xem lại</button>' : '<button class="link" data-a="ok" data-r="' + ri + '" title="✅ đã duyệt — AI không viết lại cảnh này nữa" style="font-weight:bold">duyệt</button>') : '')
       + (G.release && ri > 0 ? '<button class="link" data-a="merge" data-r="' + ri + '" title="' + (String(r.cells[G.release.index]).startsWith('↑') ? 'tách ra thành tập phát hành riêng' : 'gộp vào tập phát hành ở dòng trên (1 TAP gồm nhiều EP)') + '">' + (String(r.cells[G.release.index]).startsWith('↑') ? '⤵' : '⤴') + '</button>' : '')
       + (G.noun === 'tập' && dropped ? '<button class="link" data-a="del" data-r="' + ri + '" title="xóa hẳn dòng — mã EP không dùng lại">🗑</button>' : '')
       + (G.haveDir && !dropped && r.line >= 0 && /^EP\\d{2,}$/.test(codeOf(r)) && !G.haveDir.includes(codeOf(r)) ? '<button class="link" data-a="mkdir" data-r="' + ri + '" title="tạo thư mục tập từ mẫu">📁</button>' : '') + '</td>'
-      + r.cells.map((c, ci) => {
+      + DC.map((d) => {
+        if (d.v) return linesCell(r, ri, dropped);
+        const ci = d.ci, c = r.cells[ci];
         const rel = G.release && ci === G.release.index;
         const ro = (ci === G.codeIndex && r.line >= 0) || rel;
         const attrs = ' data-r="' + ri + '" data-c="' + ci + '"';
+        if (ci === G.wideIndex && GV) return '<td><div class="gmd" data-er="' + ri + '" data-ec="' + ci + '" title="bấm để sửa">' + imd(c) + '</div></td>';
         if (ci === G.wideIndex) return '<td><textarea' + attrs + ' style="min-height:56px;overflow:hidden">' + esc(c) + '</textarea></td>';
+        if (ci === G.statusIndex && AP()) return '<td title="' + esc(c) + '" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + stLabel(c, dropped) + '</td>';
         if (ci === G.statusIndex && G.statusChoices.length && (!dropped || G.statusChoices.some((o) => o.value === G.dropSymbol))) {
           const cur = G.statusChoices.find((o) => String(c).trim().startsWith(o.value));
           return '<td><select' + attrs + ' title="' + esc(c) + '">' + (cur ? '' : '<option value="' + esc(c) + '" selected>' + esc(c || '—') + '</option>')
@@ -531,10 +732,17 @@ function render() {
   }).join('');
   sum();
   fitAll();
-  window.scrollTo(window.scrollX, sy); if (sx) sx.scrollLeft = sl;
+  if (window.scrollY !== sy) window.scrollTo(window.scrollX, sy); if (sx && sx.scrollLeft !== sl) sx.scrollLeft = sl;
+}
+function ledit(t) {
+  const l = lrows[+t.dataset.l]; if (!l) return false;
+  const f = { text: LN.textIndex, type: LN.typeIndex, speaker: LN.speakerIndex }[t.dataset.lf];
+  if (f === undefined || f < 0) return false;
+  l.cells[f] = t.value; markL(); return true;
 }
 function edit(e) {
-  const t = e.target; if (t.dataset.r === undefined || t.dataset.c === undefined) return;
+  const t = e.target; if (t.dataset.l !== undefined) { ledit(t); return; }
+  if (t.dataset.r === undefined || t.dataset.c === undefined) return;
   rows[+t.dataset.r].cells[+t.dataset.c] = t.value; mark();
 }
 document.addEventListener('input', (e) => { edit(e); fit(e.target); });
@@ -546,7 +754,8 @@ document.addEventListener('mouseup', (e) => {
   if (h > auto + 6) TH[k] = h; else delete TH[k];
 });
 window.addEventListener('resize', fitAll);
-document.addEventListener('change', (e) => { if (e.target.tagName === 'SELECT') { edit(e); if (G && e.target.dataset.c !== undefined && +e.target.dataset.c === G.statusIndex) render(); } });
+document.addEventListener('change', (e) => { if (e.target.tagName === 'SELECT' && e.target.dataset.l !== undefined) { ledit(e.target); render(); return; }
+  if (e.target.tagName === 'SELECT') { edit(e); if (G && e.target.dataset.c !== undefined && +e.target.dataset.c === G.statusIndex) render(); } });
 // kéo đổi độ rộng cột
 let RZ = null;
 document.addEventListener('mousedown', (e) => {
@@ -556,35 +765,70 @@ document.addEventListener('mousedown', (e) => {
 });
 document.addEventListener('mousemove', (e) => {
   if (!RZ) return;
-  const w = Math.max(40, Math.round(RZ.w0 + e.clientX - RZ.x0)), name = G.headers[RZ.i];
+  const w = Math.max(40, Math.round(RZ.w0 + e.clientX - RZ.x0)), name = DN[RZ.i];
   $('grid').style.width = (parseFloat($('grid').style.width) + w - parseFloat(RZ.col.style.width)) + 'px';
   RZ.col.style.width = w + 'px'; G.widths[name] = w;
 });
 document.addEventListener('mouseup', () => {
   if (!RZ) return; RZ.h.classList.remove('on');
-  post({ type: 'widths', widths: { [G.headers[RZ.i]]: G.widths[G.headers[RZ.i]] } }); RZ = null; fitAll();
+  post({ type: 'widths', widths: { [DN[RZ.i]]: G.widths[DN[RZ.i]] } }); RZ = null; fitAll();
+});
+// 👁 Xem: bấm một ô markdown → đổi riêng ô đó thành ô gõ (17/11/2026 — trước phải bấm đúp / nút ✏ Sửa)
+function cellEdit(d) {
+  const t = document.createElement('textarea');
+  t.className = 'gedit';
+  if (d.dataset.el !== undefined) { t.dataset.l = d.dataset.el; t.dataset.lf = 'text'; t.value = lrows[+d.dataset.el].cells[LN.textIndex] || ''; t.style.minHeight = '30px'; }
+  else { t.dataset.r = d.dataset.er; t.dataset.c = d.dataset.ec; t.value = rows[+d.dataset.er].cells[+d.dataset.ec] || ''; t.style.minHeight = '56px'; }
+  t.style.overflow = 'hidden';
+  d.replaceWith(t); fit(t); t.focus();
+}
+document.addEventListener('focusout', (e) => {
+  const t = e.target; if (!GV || !t.classList || !t.classList.contains('gedit')) return;
+  const d = document.createElement('div'); d.className = 'gmd'; d.title = 'bấm để sửa';
+  if (t.dataset.l !== undefined) d.dataset.el = t.dataset.l; else { d.dataset.er = t.dataset.r; d.dataset.ec = t.dataset.c; }
+  d.innerHTML = imd(t.value); t.replaceWith(d);
 });
 document.addEventListener('dblclick', (e) => {
   const h = e.target.closest('[data-rz]'); if (!h) return;
-  const name = G.headers[+h.dataset.rz]; G.widths[name] = (G.defaults || {})[name] || 140;
+  const name = DN[+h.dataset.rz]; G.widths[name] = (G.defaults || {})[name] || 140;
   post({ type: 'widths', widths: { [name]: G.widths[name] } }); render();
 });
 document.addEventListener('click', (e) => {
+  const gm = GV && !e.target.closest('a, button') && e.target.closest('#grid .gmd'); if (gm) { cellEdit(gm); return; }
+  const la = e.target.closest('[data-la]'); if (la && LN) {
+    const li = +la.dataset.l, l = lrows[li];
+    if (la.dataset.la === 'add') { const sc = la.dataset.sc, at = linesOf(sc), cells = LN.headers.map(() => '');
+      cells[LN.codeIndex] = nextLine(sc); if (LN.oldIndex >= 0) cells[LN.oldIndex] = '—'; if (LN.typeIndex >= 0) cells[LN.typeIndex] = 'lời dẫn'; cells[LN.statusIndex] = '⬜ nháp';
+      const nl = { line: -1, cells }; if (at.length) lrows.splice(at[at.length - 1] + 1, 0, nl); else lrows.push(nl); }
+    if (la.dataset.la === 'st') { const c = lst(l); l.cells[LN.statusIndex] = /^\\s*✍/u.test(c) ? c.replace(/^\\s*✍\\s*(Trường)?/u, '⬜ nháp') : /^\\s*⬜\\s*(nháp)?/u.test(c) ? c.replace(/^\\s*⬜\\s*(nháp)?/u, '✍ Trường') : ('✍ Trường ' + c).trim(); }
+    if (la.dataset.la === 'drop') lDrop(l, '');
+    if (la.dataset.la === 'undrop') lRestore(l);
+    if (la.dataset.la === 'mv') moveLine(li, la.dataset.to, !!la.dataset.fwd);
+    markL(); render(); return;
+  }
   const b = e.target.closest('[data-a]'); if (b) {
     const i = +b.dataset.r;
-    if (b.dataset.a === 'up' && i > 0) { [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]]; mark(); render(); }
-    if (b.dataset.a === 'down' && i < rows.length - 1) { [rows[i + 1], rows[i]] = [rows[i], rows[i + 1]]; mark(); render(); }
+    if (b.dataset.a === 'up' && i > 0) { [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]]; if (LN) ldirty = true; mark(); render(); }
+    if (b.dataset.a === 'down' && i < rows.length - 1) { [rows[i + 1], rows[i]] = [rows[i], rows[i + 1]]; if (LN) ldirty = true; mark(); render(); }
     if (b.dataset.a === 'add') post({ type: 'newCode', after: i, afterCode: codeOf(rows[i]), taken: rows.map(codeOf) });
     if (b.dataset.a === 'del') { rows.splice(i, 1); mark(); render(); }
     if (b.dataset.a === 'merge') { const c = String(rows[i].cells[G.release.index] || ''); rows[i].cells[G.release.index] = c.startsWith('↑') ? '' : '↑'; mark(); render(); }
     if (b.dataset.a === 'mkdir') { if (dirty) { $('gDirty').textContent = '● lưu bảng trước khi tạo thư mục'; return; } post({ type: 'mkdir', code: codeOf(rows[i]), name: rows[i].cells[G.headers.findIndex((h) => /tên/i.test(h))] || '' }); }
+    if (b.dataset.a === 'ok') { setOk(rows[i], !isDone(rows[i])); mark(); render(); }
     if (b.dataset.a === 'drop') {
       const c = String(rows[i].cells[G.statusIndex] || '');
-      rows[i].cells[G.statusIndex] = c.includes(G.dropSymbol) ? c.replace(G.dropSymbol, '⬜').trim() : (G.dropSymbol + ' ' + c.replace(/^[⬜✍👀✅⏸]\\s*/u, '')).trim();
+      const was = c.includes(G.dropSymbol);
+      rows[i].cells[G.statusIndex] = was ? c.replace(G.dropSymbol, '⬜').trim() : (G.dropSymbol + ' ' + c.replace(/^[⬜✍👀✅⏸]\\s*/u, '')).trim();
+      // lời theo cảnh: bỏ cảnh → câu của cảnh ⛔ "bỏ theo <cảnh>"; khôi phục cảnh → câu trở lại trạng thái cũ
+      if (LN) { const sc = codeOf(rows[i]); for (const li of linesOf(sc)) { const l = lrows[li];
+        if (!was && !lOff(l)) { lDrop(l, sc); ldirty = true; }
+        if (was && new RegExp('^\\\\s*⛔\\\\s*bỏ\\\\s+theo\\\\s+' + sc + '\\\\b', 'u').test(lst(l))) { lRestore(l); ldirty = true; } } }
       mark(); render();
     }
   }
-  if (e.target.id === 'gSave') post({ type: 'save', rows });
+  if (e.target.id === 'gSave') post({ type: 'save', rows, lines: LN ? lrows : undefined, linesDirty: ldirty });
+  if (e.target.id === 'gView') { GV = !GV; gvBtn(); render(); }
+  if (e.target.id === 'gLines') { SHOWL = !SHOWL; e.target.textContent = SHOWL ? 'ẩn lời' : 'hiện lời'; render(); }
   if (e.target.id === 'gReload') { if (!dirty || confirmReload()) post({ type: 'reload' }); }
   if (e.target.id === 'gOpen') post({ type: 'open' });
 });

@@ -71,6 +71,8 @@ export interface ProjectConfig {
     statusChoices?: { value: string; label: string }[];
     /** độ rộng mặc định của cột trong lưới (px), theo tên cột */
     columnWidths?: Record<string, number>;
+    /** cột KHÔNG hiện ở lưới phân cảnh — vẫn nằm trong file, hiện ở tab của từng cảnh (17/11/2026) */
+    gridHide?: string[];
   };
   codes: {
     segment: string;
@@ -103,6 +105,8 @@ export interface ProjectConfig {
   /** bước ②: danh sách tập — mã sản xuất EPnn + số phát hành TAPnn — core/episodeList.ts */
   episodeList?: EpisodeListConfig;
   /** ⑦ lưới bảng lời <X>_loi.md */
+  /** ⑪ Tik (D-36, 17/11/2026) — bảng đoạn cắt 2–3 phút cho TikTok / Facebook / Shorts, file cấp tập (mặc định tik.md) */
+  tikTable?: { file?: string; codeColumn?: string; nameColumn?: string; secondsColumn?: string; statusColumn?: string; statusChoices?: { value: string; label: string }[]; columnWidths?: Record<string, number> };
   linesTable?: { codeColumn: string; nameColumn?: string; statusColumn?: string; columnWidths?: Record<string, number>; suggest?: Record<string, string[]> };
   /** ⑨ prompt của cảnh + ảnh dùng chung — core/scenePrompts.ts */
   scenePrompts?: import('./scenePrompts').ScenePromptConfig;
@@ -137,6 +141,10 @@ export interface StepGate {
   /** Các file phải có */
   exists?: string[];
   require?: StatusKey;
+  /** tên dòng trong câu báo, vd. 'Phân đoạn {X}' (17/11/2026) */
+  label?: string;
+  /** cách mở cổng — hiện sau câu báo */
+  hint?: string;
 }
 
 export interface StepSpec {
@@ -149,17 +157,17 @@ export interface StepSpec {
   description?: string;
   inputs?: FileRef[];
   /** replace = cả file · section = thay mục 'heading:…' · insert = chèn ngay dưới tiêu đề mục (sau dòng trích dẫn) */
-  output?: FileRef & { mode?: 'replace' | 'section' | 'insert' };
+  output?: FileRef & { mode?: 'replace' | 'section' | 'insert'; /** ⑨ / ⑩: chỉ viết tiểu mục Ảnh (anh) / Video (video) của mục cảnh — core/sceneParts.ts */ part?: 'anh' | 'video' };
   /** Phần giao diện thêm trong tab: media = lưới ảnh/clip + ghi kết quả · grid = lưới bảng cảnh ngay trong tab ·
    *  idea = form ý tưởng + phong cách · synopsis = sửa kịch bản tóm tắt + danh sách tập ·
    *  outline = sửa dàn ý tập (file đầu vào thứ nhất) · section = sửa mục đầu ra (kịch bản phân đoạn) · lines = lưới bảng lời trong tab ·
    *  prompts = prompt cảnh + ảnh dùng chung, nút chép · render = key frame / clip render + ảnh render của cảnh · segments = bảng phân đoạn của tập: duyệt từng dòng + "Phân cảnh" */
-  view?: ('media' | 'grid' | 'lines' | 'idea' | 'synopsis' | 'outline' | 'outlines' | 'segments' | 'section' | 'prompts' | 'render')[];
+  view?: ('anh' | 'video' | 'media' | 'grid' | 'lines' | 'tik' | 'idea' | 'synopsis' | 'outline' | 'outlines' | 'segments' | 'section' | 'prompts' | 'render')[];
   /** nút chuyển sang bước sau và chạy AI luôn, vd. ③ Dàn ý → "Tạo phân đoạn" → ④ */
   next?: { step: string; label: string };
   /** AI chỉ tạo lại cái CHƯA duyệt: sau khi AI trả bản đề xuất, tool khôi phục nguyên văn phần đã duyệt (core/protect.ts).
    *  scenes / lines / episodes = dòng bảng · segments = mục ## [X] · segment / scene = cả bước khóa khi đối tượng đã duyệt */
-  protect?: 'scenes' | 'lines' | 'episodes' | 'segments' | 'segment' | 'scene' | 'outline';
+  protect?: 'scenes' | 'lines' | 'tik' | 'episodes' | 'segments' | 'segment' | 'scene' | 'outline';
   /** chữ trên nút chạy AI (mặc định "Chạy"), vd. "Chia tập" */
   runLabel?: string;
   gate?: StepGate;
@@ -220,7 +228,7 @@ export function statusSymbol(key: StatusKey | undefined, status: ProjectConfig['
 }
 
 export const STATUS_LABEL: Record<StatusKey, string> = {
-  todo: 'chưa làm',
+  todo: 'chưa duyệt',
   writing: 'đang viết',
   review: 'chờ duyệt',
   done: 'duyệt',

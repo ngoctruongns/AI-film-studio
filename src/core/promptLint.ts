@@ -53,17 +53,22 @@ interface Refs {
   ids: Map<string, string>;
   /** mục "tùy chọn" — được nhắc trong prompt, không bắt buộc */
   optional: Set<string>;
+  /** ⑨/⑩ (17/11/2026): dòng "Nạp — chung" + "Nạp — riêng" gộp thành một bảng */
+  split?: boolean;
 }
+
+/** "Nạp:" · "Nạp ảnh:" · "Nạp — chung (tập / dự án):" · "Nạp — riêng (phân đoạn):" */
+const NAP_RE = /Nạp(?:\s*[—–-]\s*(chung|riêng)[^:]*)?(?: ảnh)?:(?:\*\*)?/u;
 
 /** clip (không phải ảnh): .mp4 · …_R1 · Video1 */
 const isClip = (id: string, part: string) => /\.mp4/.test(part) || /_R\d+$/.test(id) || /^Video\d+$/.test(id);
 
 function parseNap(l: string, i: number): Refs | undefined {
-  const k = l.indexOf('Nạp:');
-  if (k < 0) return undefined;
+  const m = NAP_RE.exec(l);
+  if (!m) return undefined;
   const ids = new Map<string, string>();
   const optional = new Set<string>();
-  for (const part of l.slice(k + 4).split(' · ')) {
+  for (const part of l.slice(m.index + m[0].length).split(' · ')) {
     const opt = /tùy chọn/.test(part);
     const old = /(?:\*\*)?\s*(?:\(tùy chọn\s+)?\b(Image|Video|Audio)(\d+)\b/.exec(part);
     const file = /`([A-Za-z0-9][A-Za-z0-9_]*)(?:\.(?:png|jpe?g|webp|mp4|mov|wav|mp3))?`/.exec(part);
@@ -89,17 +94,31 @@ export function lintPromptText(text: string, cfg: PromptLintConfig): PromptIssue
 
   const lines = splitLines(text);
   let refs: Refs | undefined;
+  /** tiểu mục ⑨ "### Ảnh …" / "### Ảnh mạng …" — dòng Nạp là đầu vào SeeDream, không soát như video */
+  let imgPart = false;
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
-    if (/^#{1,6}\s/.test(l)) refs = undefined;
+    if (/^#{1,6}\s/.test(l)) {
+      refs = undefined;
+      imgPart = /^#{1,6}\s+(?:[✅❌]\s*)?Ảnh\b/u.test(l);
+    }
     if (!l.startsWith('```')) {
-      const r = l.includes('Nạp:') ? parseNap(l, i) : undefined;
-      if (l.includes('Nạp:')) refs = r; // dòng Nạp của ảnh (không có ImageN) → xóa bảng cũ
+      const nap = NAP_RE.exec(l);
+      const r = nap ? parseNap(l, i) : undefined;
+      if (nap) {
+        // "Nạp — riêng" ngay sau "Nạp — chung" → gộp vào cùng một bảng
+        if (nap[1] && refs?.split && r) {
+          for (const [k, v] of r.ids) refs.ids.set(k, v);
+          for (const k of r.optional) refs.optional.add(k);
+        } else if (nap[1]) refs = r ? { ...r, split: true } : refs?.split ? refs : { line: i, ids: new Map(), optional: new Set(), split: true };
+        else refs = r; // dòng Nạp của ảnh (không có ImageN) → xóa bảng cũ
+      }
       // "Nạp ảnh:" = đầu vào SeeDream (ảnh), được nạp tấm đối chiếu nhiều góc — chỉ soát dòng Nạp của video
-      if (r && !/Nạp ảnh/.test(l)) {
-        const imgs = [...r.ids].filter(([k, part]) => !isClip(k, part)).length;
+      if (r && refs && !/Nạp ảnh/.test(l) && !imgPart) {
+        const all = refs.ids;
+        const imgs = [...all].filter(([k, part]) => !isClip(k, part)).length;
         if (cfg.hardMaxRefs && imgs > cfg.hardMaxRefs) push('P1', i, 'error', `Nạp ${imgs} ảnh — vượt giới hạn ${cfg.hardMaxRefs} ảnh của model; dùng Seedance 2.5 hoặc bớt ảnh`);
-        else if (r.ids.size > maxRefs) push('P1', i, 'warning', `Nạp ${r.ids.size} file — khuyến khích ≤ ${maxRefs}. Nhiều hơn vẫn được (clip dài cần giữ vị trí, bối cảnh) — nếu AI lẫn vai trò các ảnh thì bớt ảnh phụ trợ, giữ key frame`);
+        else if (all.size > maxRefs && !(nap?.[1] === 'chung')) push('P1', i, 'warning', `Nạp ${all.size} file — khuyến khích ≤ ${maxRefs}. Nhiều hơn vẫn được (clip dài cần giữ vị trí, bối cảnh) — nếu AI lẫn vai trò các ảnh thì bớt ảnh phụ trợ, giữ key frame`);
         if (multi) for (const [id, part] of r.ids) if (multi.test(part)) push('P5', i, 'warning', `${id} là ảnh nhiều góc — video chỉ nạp ảnh một góc (DON_…), không thì sinh thêm người / "người sinh đôi"`);
       }
       continue;
